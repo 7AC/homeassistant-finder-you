@@ -1,0 +1,20 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        },
+        "description": "Sign in with your Finder YOU account credentials."
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password.",
+      "unknown": "Unexpected error during sign-in."
+    },
+    "abort": {
+      "already_configured": "This account is already configured."
+    }
+  }
+}
