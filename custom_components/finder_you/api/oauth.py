@@ -1,6 +1,8 @@
 """OAuth flow against accounts.iot.findernet.com — Android-style, no PKCE."""
 from __future__ import annotations
 
+import asyncio
+import ssl
 import urllib.parse
 
 import httpx
@@ -21,15 +23,32 @@ class OAuthError(Exception):
     """Raised when the OAuth flow fails."""
 
 
+# Build the SSL context once in a thread executor. ssl.create_default_context()
+# calls set_default_verify_paths() which loads CAs from disk — a blocking I/O
+# operation that HA forbids on the event loop. Cache the result for reuse.
+_ssl_ctx: ssl.SSLContext | None = None
+_ssl_ctx_lock = asyncio.Lock()
+
+
+async def _get_ssl_context() -> ssl.SSLContext:
+    global _ssl_ctx
+    async with _ssl_ctx_lock:
+        if _ssl_ctx is None:
+            loop = asyncio.get_running_loop()
+            _ssl_ctx = await loop.run_in_executor(None, ssl.create_default_context)
+        return _ssl_ctx
+
+
 async def fetch_token(username: str, password: str) -> dict:
     """Mint a fresh api.v1 access_token + refresh_token via Android signin-oidc flow.
 
     Returns the JSON dict from /connect/token: access_token, refresh_token,
     expires_in, token_type, scope, id_token.
     """
+    ssl_ctx = await _get_ssl_context()
     async with httpx.AsyncClient(
         timeout=10,
-        verify=True,
+        verify=ssl_ctx,
         headers={"User-Agent": ANDROID_UA},
         follow_redirects=False,
     ) as client:

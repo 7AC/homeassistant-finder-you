@@ -76,9 +76,10 @@ class FinderHomeClient:
         self._writer: asyncio.StreamWriter | None = None
         self._encoder = hpack.Encoder()
         self._decoder = hpack.Decoder()
-        # Even stream IDs come from the server; clients use odd starting at 3.
-        # (Stream 1 is reserved for HTTP/2 upgrade.)
-        self._next_stream_id = 3
+        # Match Android's stream-ID pattern: OpenNotificationChannel goes on
+        # stream 1 (first stream of the connection); bootstrap RPCs follow on
+        # 3, 5, 7…
+        self._next_stream_id = 1
         self._stream_id_lock = asyncio.Lock()
         # client_uuid generated per integration install; not security-relevant
         # to the server but used in ClientInfo.
@@ -89,6 +90,7 @@ class FinderHomeClient:
         self._notification_queue: asyncio.Queue = asyncio.Queue()
         self._notification_stream_id: int | None = None
         self._read_task: asyncio.Task | None = None
+        self._notification_keepalive_task: asyncio.Task | None = None
 
     @classmethod
     async def connect(cls, token: str) -> "FinderHomeClient":
@@ -98,10 +100,17 @@ class FinderHomeClient:
         return self
 
     async def _connect(self) -> None:
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.set_alpn_protocols(["h2"])
-        loop = asyncio.get_event_loop()
-        # asyncio.open_connection handles TLS for us. Resolve once.
+        # Pre-build the SSLContext in a thread executor — create_default_context()
+        # does blocking disk I/O (set_default_verify_paths) which HA forbids on
+        # the event loop.
+        loop = asyncio.get_running_loop()
+
+        def _make_ctx() -> ssl.SSLContext:
+            c = ssl.create_default_context()
+            c.set_alpn_protocols(["h2"])
+            return c
+
+        ssl_ctx = await loop.run_in_executor(None, _make_ctx)
         self._reader, self._writer = await asyncio.open_connection(
             YOU_API_HOST, YOU_API_PORT, ssl=ssl_ctx, server_hostname=YOU_API_HOST
         )
@@ -260,27 +269,112 @@ class FinderHomeClient:
     # ===== High-level RPCs ============================================
 
     async def handshake(self) -> dict:
-        """Run the Android-style boot sequence: PlatformCheck, GetUserPlants,
-        OpenNotificationChannel (held open). Returns the GetUserPlants response.
+        """Run the Android-style boot sequence: CheckUser, PlatformCheck,
+        GetUserPlants, OpenNotificationChannel (held open). Returns the
+        GetUserPlants response.
+
+        CheckUser is sent without auth on stream 3 and is what makes the
+        server's session accept later device-touching calls — skipping it
+        causes GetPlant/SetOpenPercent to fail with ``code 1``.
         """
-        await self._call("PlatformCheck", field_string(1, self._client_info), with_auth=False)
-        plants_resp = await self._call("GetUserPlants", field_string(1, self._client_info))
-        # Open the notification stream and don't close it; readings come via
-        # the notification queue.
+        # The Android app opens OpenNotificationChannel **first** — before
+        # the bootstrap RPCs — on stream 1. It then does a three-step
+        # subscription handshake on that stream, after which the server
+        # considers it the "live" client and routes gateway commands to it.
+        # Skip this and every device-touching call (GetPlant, SetOpenPercent,
+        # etc.) fails with code 19. Order matters: bootstrap RPCs go on
+        # later streams (3, 5, 7…) AFTER the OpenNot subscription is
+        # established.
         assert self._writer is not None
         sid = await self._next_sid()
         self._notification_stream_id = sid
+        ci_payload = field_string(1, self._client_info)
+        # Message 1: hello, here's who I am (server replies "10 01")
         self._writer.write(
             self._build_headers_frame("OpenNotificationChannel", sid, with_auth=True)
-            + self._build_data_frame(field_string(1, self._client_info), sid, end_stream=True)
+            + self._build_data_frame(ci_payload, sid, end_stream=False)
         )
         await self._writer.drain()
-        # Wait briefly for the initial "claim acknowledged" message.
         try:
             await asyncio.wait_for(self._notification_queue.get(), timeout=3)
         except asyncio.TimeoutError:
-            _LOGGER.warning("no claim ack within 3s — proceeding anyway")
-        return parse_fields(plants_resp)
+            _LOGGER.warning("no claim ack on first notification msg within 3s")
+
+        # Send a PING — Android does this between msg 1 and msg 2.
+        ping_data = struct.pack(">Q", 0xFFFF_FFFF_FFFF_FFFF)
+        self._writer.write(
+            struct.pack(">L", 8)[1:] + bytes([TYPE_PING, 0]) + struct.pack(">L", 0) + ping_data
+        )
+        await self._writer.drain()
+        await asyncio.sleep(0.1)
+
+        # Message 2: subscribe-as-client {field 1: ClientInfo, field 2: 1}.
+        # Server replies "10 01 40 01" — the field 8 (= 0x40) addition is
+        # the "you're now the authoritative client" signal.
+        subscribe_client = ci_payload + field_varint(2, 1)
+        self._writer.write(
+            self._build_data_frame(subscribe_client, sid, end_stream=False)
+        )
+        await self._writer.drain()
+        try:
+            resp = await asyncio.wait_for(self._notification_queue.get(), timeout=3)
+            _LOGGER.info("subscribe-client response: %s", resp.hex())
+        except asyncio.TimeoutError:
+            _LOGGER.warning("no claim ack on subscribe-client within 3s")
+
+        # Now run the bootstrap RPCs. Per the Frida-captured Android flow,
+        # the app does these AFTER the OpenNot subscription is granted.
+        await self._call("CheckUser", ci_payload, with_auth=False)
+        await self._call("PlatformCheck", ci_payload, with_auth=False)
+        plants_resp = await self._call("GetUserPlants", ci_payload)
+        plants_msg = parse_fields(plants_resp)
+
+        # Message 3: subscribe-plant {field 1: ClientInfo, field 2: 2, field 3: plant_id}.
+        # Picks the plant out of the GetUserPlants response.
+        if 3 in plants_msg:
+            plant_inner = parse_fields(plants_msg[3][0])
+            plant_id = plant_inner.get(1, [b""])[0]
+            if plant_id:
+                # Android wraps plant_id one level deeper: field 3 of the
+                # subscribe-plant message is itself a message whose inner
+                # field 1 is the plant_id string.
+                plant_envelope = field_string(1, plant_id)
+                subscribe_plant = (
+                    ci_payload + field_varint(2, 2) + field_string(3, plant_envelope)
+                )
+                self._writer.write(
+                    self._build_data_frame(subscribe_plant, sid, end_stream=False)
+                )
+                await self._writer.drain()
+                # Wait for plant-subscribe response — Android receives a
+                # large plant-state payload after this; we just need to know
+                # the gateway has acked routing.
+                try:
+                    resp = await asyncio.wait_for(self._notification_queue.get(), timeout=5)
+                    _LOGGER.info("subscribe-plant response (%d B): %s", len(resp), resp[:60].hex())
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("no subscribe-plant response within 5s")
+
+        # Keepalive: re-send subscribe-client every 30 s to hold the claim.
+        self._notification_keepalive_task = asyncio.create_task(
+            self._notification_keepalive(sid, subscribe_client)
+        )
+        return plants_msg
+
+    async def _notification_keepalive(self, sid: int, keepalive_body: bytes) -> None:
+        """Re-send the subscribe-client message every 30 s so the cloud
+        keeps us as the authoritative live client."""
+        try:
+            while True:
+                await asyncio.sleep(30)
+                if self._writer is None:
+                    return
+                self._writer.write(self._build_data_frame(keepalive_body, sid, end_stream=False))
+                await self._writer.drain()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _LOGGER.exception("notification keepalive crashed")
 
     async def get_plant(self, plant_id: bytes) -> bytes:
         return await self._call(
@@ -313,6 +407,8 @@ class FinderHomeClient:
         await self._call("CloseFull", body)
 
     async def close(self) -> None:
+        if self._notification_keepalive_task:
+            self._notification_keepalive_task.cancel()
         if self._read_task:
             self._read_task.cancel()
         if self._writer:
