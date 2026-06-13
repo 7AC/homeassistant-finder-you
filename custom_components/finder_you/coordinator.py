@@ -100,6 +100,34 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         self._client = client
         return client
 
+    async def _drop_client(self) -> None:
+        """Close + forget the current client so the next call reconnects."""
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                pass
+            self._client = None
+
+    async def _run_or_reconnect(self, fn):
+        """Run ``fn(client)`` once. If the connection looks dead (any error or
+        timeout), drop the client and retry once with a fresh one.
+
+        Without this, a silent GOAWAY or a coordinator update timeout leaves
+        ``_client`` half-broken: HA service calls would write into a closed
+        socket and hang forever, with no log line, because the underlying
+        cloud protocol has no exception path that surfaces above the
+        per-call read.
+        """
+        try:
+            client = await self._ensure_client()
+            return await asyncio.wait_for(fn(client), timeout=15)
+        except Exception as err:
+            _LOGGER.info("client call failed (%s); reconnecting", err)
+            await self._drop_client()
+            client = await self._ensure_client()
+            return await asyncio.wait_for(fn(client), timeout=15)
+
     async def _async_update_data(self) -> dict[str, int]:
         """Fetch plant + return ``{shutter_uuid: position}`` for HA cover.
 
@@ -109,18 +137,18 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         decoding is implemented. HA still allows commanding.
         """
         try:
-            client = await self._ensure_client()
-            assert self._plant_id is not None
-            plant_payload = await client.get_plant(self._plant_id)
-        except (FinderApiError, ConnectionError, OAuthError) as err:
-            # Tear down so we reconnect next round.
-            if self._client:
-                try:
-                    await self._client.close()
-                except Exception:
-                    pass
-                self._client = None
+            assert self._plant_id is None or self._plant_id is not None
+            plant_payload = await self._run_or_reconnect(
+                lambda c: c.get_plant(self._plant_id) if self._plant_id else c.handshake()
+            )
+        except (FinderApiError, ConnectionError, OAuthError, asyncio.TimeoutError, OSError) as err:
+            await self._drop_client()
             raise UpdateFailed(str(err)) from err
+
+        # If we fell back to handshake (no plant_id yet), the payload is the
+        # plants_msg dict, not the raw plant bytes.
+        if isinstance(plant_payload, dict):
+            return {s.uuid: None for s in self._shutters}
 
         plant_name, shutters = parse_plant(plant_payload)
         self._plant_name = plant_name or self._plant_name
@@ -130,19 +158,22 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         return {s.uuid: None for s in self._shutters}
 
     async def async_set_position(self, shutter_uuid: str, percent: int) -> None:
-        client = await self._ensure_client()
         assert self._plant_id is not None
-        await client.set_open_percent(self._plant_id, shutter_uuid.encode(), percent)
+        await self._run_or_reconnect(
+            lambda c: c.set_open_percent(self._plant_id, shutter_uuid.encode(), percent)
+        )
 
     async def async_open(self, shutter_uuid: str) -> None:
-        client = await self._ensure_client()
         assert self._plant_id is not None
-        await client.open_full(self._plant_id, shutter_uuid.encode())
+        await self._run_or_reconnect(
+            lambda c: c.open_full(self._plant_id, shutter_uuid.encode())
+        )
 
     async def async_close_shutter(self, shutter_uuid: str) -> None:
-        client = await self._ensure_client()
         assert self._plant_id is not None
-        await client.close_full(self._plant_id, shutter_uuid.encode())
+        await self._run_or_reconnect(
+            lambda c: c.close_full(self._plant_id, shutter_uuid.encode())
+        )
 
     async def async_shutdown(self) -> None:
         if self._client:
