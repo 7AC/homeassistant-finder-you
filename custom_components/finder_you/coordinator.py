@@ -24,16 +24,10 @@ from .api import (
 )
 from .const import CONF_EMAIL, CONF_PASSWORD, DEFAULT_SCAN_INTERVAL_SECONDS, DOMAIN
 
-# How long to wait for the YESLY gateway to push a state-change notification
-# after we issue a command. The cloud acks instantly; the gateway needs a beat
-# to relay over MQTT and reply.
-GATEWAY_ACK_TIMEOUT = 3.0
-# When the gateway drops a command (no notification within the timeout) we
-# retry from scratch -- the gateway's MQTT link is flaky on WiFi-only models
-# and a fresh send a moment later often lands. ATTEMPTS includes the first
-# try; total wall-clock budget is roughly ATTEMPTS * (ACK_TIMEOUT + DELAY).
-GATEWAY_RETRY_ATTEMPTS = 3
-GATEWAY_RETRY_DELAY = 0.5
+# How long to listen for a gateway notification after a command. Best-effort
+# only -- in practice the YESLY gateway often executes commands without
+# notifying, so absence of a notification doesn't mean the command failed.
+GATEWAY_ACK_TIMEOUT = 2.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -176,42 +170,29 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         return {s.uuid: None for s in self._shutters}
 
     async def _command_with_gateway_ack(self, shutter_uuid: str, do_call) -> None:
-        """Send a command, then wait for the gateway's state notification.
-        Retries silently up to GATEWAY_RETRY_ATTEMPTS times to smooth over
-        the YESLY gateway's flaky-WiFi behavior.
+        """Send a command. Treat the cloud's HTTP/2 ack as success.
 
-        The cloud-side success reply is meaningless on its own: if the gateway
-        has lost its MQTT link, the cloud still acks our command but it
-        never reaches the shutter. The gateway's notification on
-        OpenNotificationChannel is the only reliable proof the command
-        actually landed -- and on a marginal WiFi link that notification is
-        intermittent. Resending after a short delay almost always wins on
-        the second or third attempt.
+        Observed in the field: the YESLY gateway sometimes executes a
+        command without then pushing a state-change notification back on
+        OpenNotificationChannel. We can't tell "no notification" apart from
+        "command never reached the gateway" -- the notification path and
+        the command path don't share fate.
+
+        Trade-off: trust the cloud-ack so commands feel responsive in Home.
+        Best-effort listen for a notification afterwards (improves the
+        eventual position read once we decode state events properly) but
+        never fail the command on its absence.
         """
-        async def call_then_wait(c: FinderHomeClient) -> None:
+        async def call_then_listen(c: FinderHomeClient) -> None:
             await do_call(c)
-            await c.wait_for_shutter_event(shutter_uuid.encode(), GATEWAY_ACK_TIMEOUT)
-
-        last_err: GatewayOfflineError | None = None
-        for attempt in range(1, GATEWAY_RETRY_ATTEMPTS + 1):
             try:
-                await self._run_or_reconnect(call_then_wait)
-                if attempt > 1:
-                    _LOGGER.info(
-                        "shutter %s command landed on attempt %d/%d",
-                        shutter_uuid, attempt, GATEWAY_RETRY_ATTEMPTS,
-                    )
-                return
-            except GatewayOfflineError as err:
-                last_err = err
-                _LOGGER.info(
-                    "gateway didn't ack %s on attempt %d/%d: %s",
-                    shutter_uuid, attempt, GATEWAY_RETRY_ATTEMPTS, err,
-                )
-                if attempt < GATEWAY_RETRY_ATTEMPTS:
-                    await asyncio.sleep(GATEWAY_RETRY_DELAY)
-        assert last_err is not None
-        raise last_err
+                await c.wait_for_shutter_event(shutter_uuid.encode(), GATEWAY_ACK_TIMEOUT)
+            except GatewayOfflineError:
+                # Common -- the gateway often acts without notifying. Don't
+                # bubble; the action probably succeeded.
+                pass
+
+        await self._run_or_reconnect(call_then_listen)
 
     async def async_set_position(self, shutter_uuid: str, percent: int) -> None:
         assert self._plant_id is not None

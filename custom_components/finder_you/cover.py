@@ -11,13 +11,12 @@ from homeassistant.components.cover import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import GatewayOfflineError, Shutter
+from .api import Shutter
 from .const import DOMAIN
 from .coordinator import FinderYouCoordinator
 
@@ -92,17 +91,7 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity, Resto
         return pos == 0
 
     async def _send(self, op, target_position: int) -> None:
-        try:
-            await op()
-        except GatewayOfflineError as err:
-            # Don't flip the entity state -- the cloud accepted but the
-            # gateway didn't relay. Raising HomeAssistantError makes HA's
-            # service caller surface the failure to HomeKit / the UI instead
-            # of silently pretending it worked.
-            raise HomeAssistantError(
-                f"Finder gateway didn't acknowledge — shutter likely didn't move "
-                f"({err}). Check the YESLY gateway is online."
-            ) from err
+        await op()
         self._last_commanded_position = target_position
         self.async_write_ha_state()
 
