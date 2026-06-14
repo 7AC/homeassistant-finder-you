@@ -14,6 +14,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import GatewayOfflineError, Shutter
@@ -34,7 +35,7 @@ async def async_setup_entry(
     )
 
 
-class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity):
+class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity, RestoreEntity):
     _attr_has_entity_name = True
     _attr_device_class = CoverDeviceClass.SHUTTER
     _attr_supported_features = (
@@ -61,6 +62,22 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity):
             suggested_area=shutter.room,
         )
         self._last_commanded_position: int = 100
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the last commanded position from before HA restarted.
+
+        Without this, HA boots with every cover defaulted to position 100
+        (open). The HomeKit bridge remembers the user's last target
+        (often 0 if they closed everything before bed) and shows the
+        Home tile stuck on "Closing…" forever because CurrentPosition
+        and TargetPosition disagree until the user issues a new command.
+        """
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None:
+            pos = last.attributes.get("current_position")
+            if isinstance(pos, (int, float)):
+                self._last_commanded_position = int(pos)
 
     @property
     def current_cover_position(self) -> int | None:
