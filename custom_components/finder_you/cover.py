@@ -41,6 +41,11 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity):
         | CoverEntityFeature.CLOSE
         | CoverEntityFeature.SET_POSITION
     )
+    # The cloud's reply to SetOpenPercent is a synchronous ack — the gateway
+    # drives the motor asynchronously and v1 has no real-time position
+    # feedback. Marking the state as assumed makes HomeKit accept the
+    # commanded position as terminal instead of hanging on "Opening…".
+    _attr_assumed_state = True
 
     def __init__(self, coordinator: FinderYouCoordinator, shutter: Shutter) -> None:
         super().__init__(coordinator)
@@ -54,12 +59,12 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity):
             model="YESLY Roller Shutter",
             suggested_area=shutter.room,
         )
+        self._last_commanded_position: int = 100
 
     @property
     def current_cover_position(self) -> int | None:
-        # v1: no position feedback. Returning None makes the UI show an
-        # unknown state but still allows open/close/set commands.
-        return self.coordinator.data.get(self._shutter.uuid) if self.coordinator.data else None
+        observed = self.coordinator.data.get(self._shutter.uuid) if self.coordinator.data else None
+        return observed if observed is not None else self._last_commanded_position
 
     @property
     def is_closed(self) -> bool | None:
@@ -70,11 +75,16 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity):
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         await self.coordinator.async_open(self._shutter.uuid)
+        self._last_commanded_position = 100
+        self.async_write_ha_state()
 
     async def async_close_cover(self, **kwargs: Any) -> None:
         await self.coordinator.async_close_shutter(self._shutter.uuid)
+        self._last_commanded_position = 0
+        self.async_write_ha_state()
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
-        await self.coordinator.async_set_position(
-            self._shutter.uuid, kwargs[ATTR_POSITION]
-        )
+        pos = kwargs[ATTR_POSITION]
+        await self.coordinator.async_set_position(self._shutter.uuid, pos)
+        self._last_commanded_position = pos
+        self.async_write_ha_state()
