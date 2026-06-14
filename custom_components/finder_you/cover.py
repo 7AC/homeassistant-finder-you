@@ -11,12 +11,13 @@ from homeassistant.components.cover import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import Shutter
+from .api import GatewayOfflineError, Shutter
 from .const import DOMAIN
 from .coordinator import FinderYouCoordinator
 
@@ -91,7 +92,15 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity, Resto
         return pos == 0
 
     async def _send(self, op, target_position: int) -> None:
-        await op()
+        try:
+            await op()
+        except GatewayOfflineError as err:
+            # Coordinator verified the gateway never reflected the command
+            # in plant state across multiple attempts. Don't lie to HomeKit.
+            raise HomeAssistantError(
+                f"YESLY gateway didn't acknowledge the {self._shutter.name} "
+                f"command after retries ({err}). Check the gateway is online."
+            ) from err
         self._last_commanded_position = target_position
         self.async_write_ha_state()
 
