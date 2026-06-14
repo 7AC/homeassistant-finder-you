@@ -28,6 +28,12 @@ from .const import CONF_EMAIL, CONF_PASSWORD, DEFAULT_SCAN_INTERVAL_SECONDS, DOM
 # after we issue a command. The cloud acks instantly; the gateway needs a beat
 # to relay over MQTT and reply.
 GATEWAY_ACK_TIMEOUT = 3.0
+# When the gateway drops a command (no notification within the timeout) we
+# retry from scratch -- the gateway's MQTT link is flaky on WiFi-only models
+# and a fresh send a moment later often lands. ATTEMPTS includes the first
+# try; total wall-clock budget is roughly ATTEMPTS * (ACK_TIMEOUT + DELAY).
+GATEWAY_RETRY_ATTEMPTS = 3
+GATEWAY_RETRY_DELAY = 0.5
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -171,18 +177,41 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
 
     async def _command_with_gateway_ack(self, shutter_uuid: str, do_call) -> None:
         """Send a command, then wait for the gateway's state notification.
+        Retries silently up to GATEWAY_RETRY_ATTEMPTS times to smooth over
+        the YESLY gateway's flaky-WiFi behavior.
 
         The cloud-side success reply is meaningless on its own: if the gateway
-        in the user's home has lost its MQTT link, the cloud still acks our
-        command but it never reaches the shutter. Waiting for the gateway's
-        notification on OpenNotificationChannel is the only reliable proof
-        the command actually landed.
+        has lost its MQTT link, the cloud still acks our command but it
+        never reaches the shutter. The gateway's notification on
+        OpenNotificationChannel is the only reliable proof the command
+        actually landed -- and on a marginal WiFi link that notification is
+        intermittent. Resending after a short delay almost always wins on
+        the second or third attempt.
         """
         async def call_then_wait(c: FinderHomeClient) -> None:
             await do_call(c)
             await c.wait_for_shutter_event(shutter_uuid.encode(), GATEWAY_ACK_TIMEOUT)
 
-        await self._run_or_reconnect(call_then_wait)
+        last_err: GatewayOfflineError | None = None
+        for attempt in range(1, GATEWAY_RETRY_ATTEMPTS + 1):
+            try:
+                await self._run_or_reconnect(call_then_wait)
+                if attempt > 1:
+                    _LOGGER.info(
+                        "shutter %s command landed on attempt %d/%d",
+                        shutter_uuid, attempt, GATEWAY_RETRY_ATTEMPTS,
+                    )
+                return
+            except GatewayOfflineError as err:
+                last_err = err
+                _LOGGER.info(
+                    "gateway didn't ack %s on attempt %d/%d: %s",
+                    shutter_uuid, attempt, GATEWAY_RETRY_ATTEMPTS, err,
+                )
+                if attempt < GATEWAY_RETRY_ATTEMPTS:
+                    await asyncio.sleep(GATEWAY_RETRY_DELAY)
+        assert last_err is not None
+        raise last_err
 
     async def async_set_position(self, shutter_uuid: str, percent: int) -> None:
         assert self._plant_id is not None
