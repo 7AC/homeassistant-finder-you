@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import (
     FinderApiError,
     FinderHomeClient,
+    GatewayOfflineError,
     OAuthError,
     Shutter,
     fetch_token,
@@ -22,6 +23,11 @@ from .api import (
     refresh_token,
 )
 from .const import CONF_EMAIL, CONF_PASSWORD, DEFAULT_SCAN_INTERVAL_SECONDS, DOMAIN
+
+# How long to wait for the YESLY gateway to push a state-change notification
+# after we issue a command. The cloud acks instantly; the gateway needs a beat
+# to relay over MQTT and reply.
+GATEWAY_ACK_TIMEOUT = 3.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -118,10 +124,16 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         socket and hang forever, with no log line, because the underlying
         cloud protocol has no exception path that surfaces above the
         per-call read.
+
+        GatewayOfflineError is NOT a connection problem -- it's the gateway
+        in the user's home not responding. Reconnecting wouldn't help, and
+        retrying would just timeout again, doubling the wait. Let it bubble.
         """
         try:
             client = await self._ensure_client()
             return await asyncio.wait_for(fn(client), timeout=15)
+        except GatewayOfflineError:
+            raise
         except Exception as err:
             _LOGGER.info("client call failed (%s); reconnecting", err)
             await self._drop_client()
@@ -157,22 +169,40 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         # State map unknown for v1.
         return {s.uuid: None for s in self._shutters}
 
+    async def _command_with_gateway_ack(self, shutter_uuid: str, do_call) -> None:
+        """Send a command, then wait for the gateway's state notification.
+
+        The cloud-side success reply is meaningless on its own: if the gateway
+        in the user's home has lost its MQTT link, the cloud still acks our
+        command but it never reaches the shutter. Waiting for the gateway's
+        notification on OpenNotificationChannel is the only reliable proof
+        the command actually landed.
+        """
+        async def call_then_wait(c: FinderHomeClient) -> None:
+            await do_call(c)
+            await c.wait_for_shutter_event(shutter_uuid.encode(), GATEWAY_ACK_TIMEOUT)
+
+        await self._run_or_reconnect(call_then_wait)
+
     async def async_set_position(self, shutter_uuid: str, percent: int) -> None:
         assert self._plant_id is not None
-        await self._run_or_reconnect(
-            lambda c: c.set_open_percent(self._plant_id, shutter_uuid.encode(), percent)
+        await self._command_with_gateway_ack(
+            shutter_uuid,
+            lambda c: c.set_open_percent(self._plant_id, shutter_uuid.encode(), percent),
         )
 
     async def async_open(self, shutter_uuid: str) -> None:
         assert self._plant_id is not None
-        await self._run_or_reconnect(
-            lambda c: c.open_full(self._plant_id, shutter_uuid.encode())
+        await self._command_with_gateway_ack(
+            shutter_uuid,
+            lambda c: c.open_full(self._plant_id, shutter_uuid.encode()),
         )
 
     async def async_close_shutter(self, shutter_uuid: str) -> None:
         assert self._plant_id is not None
-        await self._run_or_reconnect(
-            lambda c: c.close_full(self._plant_id, shutter_uuid.encode())
+        await self._command_with_gateway_ack(
+            shutter_uuid,
+            lambda c: c.close_full(self._plant_id, shutter_uuid.encode()),
         )
 
     async def async_shutdown(self) -> None:

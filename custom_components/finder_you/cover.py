@@ -11,11 +11,12 @@ from homeassistant.components.cover import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import Shutter
+from .api import GatewayOfflineError, Shutter
 from .const import DOMAIN
 from .coordinator import FinderYouCoordinator
 
@@ -73,18 +74,33 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity):
             return None
         return pos == 0
 
-    async def async_open_cover(self, **kwargs: Any) -> None:
-        await self.coordinator.async_open(self._shutter.uuid)
-        self._last_commanded_position = 100
+    async def _send(self, op, target_position: int) -> None:
+        try:
+            await op()
+        except GatewayOfflineError as err:
+            # Don't flip the entity state -- the cloud accepted but the
+            # gateway didn't relay. Raising HomeAssistantError makes HA's
+            # service caller surface the failure to HomeKit / the UI instead
+            # of silently pretending it worked.
+            raise HomeAssistantError(
+                f"Finder gateway didn't acknowledge — shutter likely didn't move "
+                f"({err}). Check the YESLY gateway is online."
+            ) from err
+        self._last_commanded_position = target_position
         self.async_write_ha_state()
 
+    async def async_open_cover(self, **kwargs: Any) -> None:
+        await self._send(
+            lambda: self.coordinator.async_open(self._shutter.uuid), 100
+        )
+
     async def async_close_cover(self, **kwargs: Any) -> None:
-        await self.coordinator.async_close_shutter(self._shutter.uuid)
-        self._last_commanded_position = 0
-        self.async_write_ha_state()
+        await self._send(
+            lambda: self.coordinator.async_close_shutter(self._shutter.uuid), 0
+        )
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         pos = kwargs[ATTR_POSITION]
-        await self.coordinator.async_set_position(self._shutter.uuid, pos)
-        self._last_commanded_position = pos
-        self.async_write_ha_state()
+        await self._send(
+            lambda: self.coordinator.async_set_position(self._shutter.uuid, pos), pos
+        )

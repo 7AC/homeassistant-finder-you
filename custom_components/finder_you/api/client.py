@@ -59,6 +59,18 @@ class FinderApiError(Exception):
         self.code = code
 
 
+class GatewayOfflineError(Exception):
+    """Raised when the cloud acked a command but the gateway never reported
+    back the corresponding state-change notification within the timeout.
+
+    The cloud's HTTP/2 reply is just routing-layer success; the YESLY gateway
+    in the user's home is responsible for actually moving the shutter and
+    pushing a state notification back over OpenNotificationChannel. When the
+    gateway's MQTT link is dead, the cloud still acks 0801 but the shutter
+    never moves -- the only way to detect this is the missing notification.
+    """
+
+
 def _build_frame(ftype: int, flags: int, sid: int, body: bytes) -> bytes:
     return struct.pack(">L", len(body))[1:] + bytes([ftype, flags]) + struct.pack(">L", sid) + body
 
@@ -91,6 +103,9 @@ class FinderHomeClient:
         self._notification_stream_id: int | None = None
         self._read_task: asyncio.Task | None = None
         self._notification_keepalive_task: asyncio.Task | None = None
+        # shutter_uuid (str) -> list of waiters to resolve next time the cloud
+        # streams back a notification mentioning that shutter.
+        self._shutter_waiters: dict[str, list[asyncio.Future]] = {}
 
     @classmethod
     async def connect(cls, token: str) -> "FinderHomeClient":
@@ -174,7 +189,9 @@ class FinderHomeClient:
                         # gRPC framing prefix (5B) is part of each message.
                         if len(body) >= 5:
                             msg_len = int.from_bytes(body[1:5], "big")
-                            self._notification_queue.put_nowait(body[5 : 5 + msg_len])
+                            msg = body[5 : 5 + msg_len]
+                            self._notification_queue.put_nowait(msg)
+                            self._dispatch_shutter_event(msg)
                     else:
                         buf = data_bufs.setdefault(sid, bytearray())
                         buf.extend(body)
@@ -217,6 +234,66 @@ class FinderHomeClient:
             # Strip the 5-byte gRPC framing prefix from the body
             payload = body[5:] if len(body) >= 5 else b""
             fut.set_result((payload, status))
+
+    def _dispatch_shutter_event(self, msg: bytes) -> None:
+        """Scan a notification for UUIDs and wake any waiter for that shutter.
+
+        The cloud streams shutter state-change events as nested protobufs
+        embedded in field 5 of the notification body. We walk anything that
+        looks length-delimited and resolve futures for any UUID-shaped
+        string we find -- belt-and-braces, since the exact field structure
+        is opaque and may differ between OpenFull / CloseFull / SetOpenPercent.
+        """
+        try:
+            seen: set[str] = set()
+            stack = [msg]
+            while stack:
+                buf = stack.pop()
+                try:
+                    fields = parse_fields(buf)
+                except Exception:
+                    continue
+                for vals in fields.values():
+                    for v in vals:
+                        if not isinstance(v, bytes):
+                            continue
+                        if len(v) == 36 and v.count(b"-") == 4:
+                            seen.add(v.decode("ascii", errors="ignore"))
+                        elif 2 <= len(v) <= 4096:
+                            stack.append(v)
+            for uuid_str in seen:
+                waiters = self._shutter_waiters.pop(uuid_str, None)
+                if not waiters:
+                    continue
+                for fut in waiters:
+                    if not fut.done():
+                        fut.set_result(None)
+        except Exception:
+            _LOGGER.exception("dispatch_shutter_event failed")
+
+    async def wait_for_shutter_event(self, shutter_id: bytes, timeout: float) -> None:
+        """Block until the gateway pushes a notification mentioning shutter_id.
+
+        Raises ``GatewayOfflineError`` if no notification arrives within
+        ``timeout``. Use this right after a command call to verify the
+        gateway actually relayed the action (rather than the cloud just
+        acking it into the void).
+        """
+        key = shutter_id.decode("ascii") if isinstance(shutter_id, bytes) else shutter_id
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._shutter_waiters.setdefault(key, []).append(fut)
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError as err:
+            # Clean up our entry so a late notification doesn't pop a stale future.
+            waiters = self._shutter_waiters.get(key)
+            if waiters and fut in waiters:
+                waiters.remove(fut)
+                if not waiters:
+                    self._shutter_waiters.pop(key, None)
+            raise GatewayOfflineError(
+                f"no gateway notification for {key} within {timeout}s"
+            ) from err
 
     async def _next_sid(self) -> int:
         async with self._stream_id_lock:
