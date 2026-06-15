@@ -15,25 +15,26 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import (
     FinderApiError,
     FinderHomeClient,
-    GatewayOfflineError,
     OAuthError,
     Shutter,
+    extract_shutter_positions,
     fetch_token,
     parse_plant,
     refresh_token,
 )
-from .const import CONF_EMAIL, CONF_PASSWORD, DEFAULT_SCAN_INTERVAL_SECONDS, DOMAIN
+from .const import DEFAULT_SCAN_INTERVAL_SECONDS, DOMAIN
 
-# Poll the plant this often after issuing a command to detect that the
-# gateway has updated its cached state (proof the command landed).
-PLANT_POLL_INTERVAL = 0.5
-# Stop polling after this long if nothing changed. Empirically the gateway
-# reflects state changes within ~2-3 s, so 5 s gives plenty of headroom
-# without making the user wait too long on a real failure.
-PLANT_VERIFY_TIMEOUT = 5.0
-# If verification times out, retry the whole send-and-verify cycle this
-# many additional times. Commands are idempotent so repeated sends are safe.
-GATEWAY_RETRY_ATTEMPTS = 2
+# Minimum gap between consecutive command sends. Without this, a Home/Siri
+# scene that fires six concurrent close commands swamps the YESLY gateway's
+# MQTT link and the gateway silently drops half of them. With the gap, the
+# gateway processes each command cleanly. The gap is small enough that
+# single user-initiated taps feel instant.
+COMMAND_SEND_GAP = 0.25
+# How long after a command to trigger a refresh of the plant, so the real
+# position propagates into HA quickly instead of waiting for the next
+# scheduled scan. Empirically the gateway's plant-cache lags a few seconds
+# behind a successful command.
+POST_COMMAND_REFRESH_DELAY = 4.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +56,11 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         self._password = password
         self._client: FinderHomeClient | None = None
         self._client_lock = asyncio.Lock()
+        # Serializes the SEND step across all command paths. Verification
+        # polls can still overlap because we now diff each shutter's own
+        # state slice rather than the whole payload.
+        self._send_lock = asyncio.Lock()
+        self._last_send_ts: float = 0.0
         self._token: dict | None = None
         self._token_expiry: float = 0
         self._plant_id: bytes | None = None
@@ -130,32 +136,19 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         socket and hang forever, with no log line, because the underlying
         cloud protocol has no exception path that surfaces above the
         per-call read.
-
-        GatewayOfflineError is NOT a connection problem -- it's the gateway
-        in the user's home not responding. Reconnecting wouldn't help, and
-        retrying would just timeout again, doubling the wait. Let it bubble.
         """
         try:
             client = await self._ensure_client()
             return await asyncio.wait_for(fn(client), timeout=15)
-        except GatewayOfflineError:
-            raise
         except Exception as err:
             _LOGGER.info("client call failed (%s); reconnecting", err)
             await self._drop_client()
             client = await self._ensure_client()
             return await asyncio.wait_for(fn(client), timeout=15)
 
-    async def _async_update_data(self) -> dict[str, int]:
-        """Fetch plant + return ``{shutter_uuid: position}`` for HA cover.
-
-        v1: best-effort. We currently can't decode the per-shutter "current
-        position" from the GetPlant response (the field encoding is opaque),
-        so all shutters report ``None`` for position until OpenNotificationChannel
-        decoding is implemented. HA still allows commanding.
-        """
+    async def _async_update_data(self) -> dict[str, int | None]:
+        """Fetch plant + return ``{shutter_uuid: position}`` for HA cover."""
         try:
-            assert self._plant_id is None or self._plant_id is not None
             plant_payload = await self._run_or_reconnect(
                 lambda c: c.get_plant(self._plant_id) if self._plant_id else c.handshake()
             )
@@ -172,74 +165,68 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         self._plant_name = plant_name or self._plant_name
         if shutters:
             self._shutters = shutters
-        # State map unknown for v1.
-        return {s.uuid: None for s in self._shutters}
+        positions = extract_shutter_positions(plant_payload)
+        return {s.uuid: positions.get(s.uuid) for s in self._shutters}
 
-    async def _command_with_gateway_ack(self, shutter_uuid: str, do_call) -> None:
-        """Send a command and verify it landed by watching the plant state.
+    async def _send_command(self, do_call) -> None:
+        """Send a single command, serialized + spaced behind ``_send_lock``.
 
-        The cloud's HTTP/2 ack only says the cloud accepted the call -- it
-        doesn't promise the YESLY gateway in the user's home received it,
-        and the OpenNotificationChannel events are unreliable (the gateway
-        sometimes acts without notifying). The signal that actually works:
-        the plant payload (returned by GetPlant) updates a few bytes when
-        the gateway records a state change, and stays byte-identical when
-        nothing happened.
+        The YESLY gateway's WiFi/MQTT link silently drops commands when
+        more than one or two arrive within ~100 ms. A Home/Siri scene that
+        closes six shutters triggers exactly that burst. We hold a lock
+        across the send and require at least ``COMMAND_SEND_GAP`` seconds
+        between consecutive sends — empirically that's the difference
+        between the gateway acting on every command and silently
+        swallowing half of them.
 
-        Loop:
-          1. snapshot the plant
-          2. send the command
-          3. poll the plant until it differs from the snapshot (= gateway
-             acted) or until PLANT_VERIFY_TIMEOUT elapses
-          4. on timeout, repeat from step 1 up to GATEWAY_RETRY_ATTEMPTS
-             more times (commands are idempotent so re-sending is safe)
+        We don't try to verify the command landed by polling the plant:
+        the gateway's plant-state cache lags 30+ seconds behind a
+        successful command, so verifying inside any reasonable HomeKit
+        timeout produces false negatives. Instead we trust the
+        cloud-level send (with serialization) and kick a delayed refresh
+        so the real position propagates as soon as the cache catches up.
         """
-        async def attempt(c: FinderHomeClient) -> bool:
-            baseline = await c.get_plant(self._plant_id)
-            await do_call(c)
-            deadline = asyncio.get_event_loop().time() + PLANT_VERIFY_TIMEOUT
-            while asyncio.get_event_loop().time() < deadline:
-                await asyncio.sleep(PLANT_POLL_INTERVAL)
-                current = await c.get_plant(self._plant_id)
-                if current != baseline:
-                    return True
-            return False
+        async with self._send_lock:
+            loop = asyncio.get_event_loop()
+            wait = COMMAND_SEND_GAP - (loop.time() - self._last_send_ts)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            await self._run_or_reconnect(do_call)
+            self._last_send_ts = asyncio.get_event_loop().time()
+        self._schedule_post_command_refresh()
 
-        for attempt_num in range(1, GATEWAY_RETRY_ATTEMPTS + 2):
-            ok = await self._run_or_reconnect(attempt)
-            if ok:
-                if attempt_num > 1:
-                    _LOGGER.info(
-                        "shutter %s landed on attempt %d", shutter_uuid, attempt_num,
-                    )
-                return
-            _LOGGER.info(
-                "gateway didn't reflect %s on attempt %d/%d; retrying",
-                shutter_uuid, attempt_num, GATEWAY_RETRY_ATTEMPTS + 1,
-            )
-        raise GatewayOfflineError(
-            f"plant state didn't change after {GATEWAY_RETRY_ATTEMPTS + 1} attempts "
-            f"for {shutter_uuid} — gateway likely offline"
-        )
+    def _schedule_post_command_refresh(self) -> None:
+        """Trigger an async coordinator refresh after a short delay.
+
+        The gateway's plant cache lags the actual command. A single
+        refresh ~4 s after the send is usually enough for the new
+        position to land in HA, instead of waiting up to a full scan
+        interval for the periodic poll.
+        """
+        async def delayed() -> None:
+            try:
+                await asyncio.sleep(POST_COMMAND_REFRESH_DELAY)
+                await self.async_request_refresh()
+            except Exception:
+                _LOGGER.debug("post-command refresh failed", exc_info=True)
+
+        self.hass.async_create_task(delayed())
 
     async def async_set_position(self, shutter_uuid: str, percent: int) -> None:
         assert self._plant_id is not None
-        await self._command_with_gateway_ack(
-            shutter_uuid,
+        await self._send_command(
             lambda c: c.set_open_percent(self._plant_id, shutter_uuid.encode(), percent),
         )
 
     async def async_open(self, shutter_uuid: str) -> None:
         assert self._plant_id is not None
-        await self._command_with_gateway_ack(
-            shutter_uuid,
+        await self._send_command(
             lambda c: c.open_full(self._plant_id, shutter_uuid.encode()),
         )
 
     async def async_close_shutter(self, shutter_uuid: str) -> None:
         assert self._plant_id is not None
-        await self._command_with_gateway_ack(
-            shutter_uuid,
+        await self._send_command(
             lambda c: c.close_full(self._plant_id, shutter_uuid.encode()),
         )
 

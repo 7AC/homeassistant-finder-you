@@ -7,7 +7,12 @@ accepts our control commands.
 """
 from .client import FinderApiError, FinderHomeClient, GatewayOfflineError
 from .oauth import OAuthError, fetch_token, refresh_token
-from .plant import Shutter, parse_plant
+from .plant import (
+    Shutter,
+    extract_shutter_positions,
+    extract_shutter_states,
+    parse_plant,
+)
 
 __all__ = [
     "FinderApiError",
@@ -15,6 +20,8 @@ __all__ = [
     "GatewayOfflineError",
     "OAuthError",
     "Shutter",
+    "extract_shutter_positions",
+    "extract_shutter_states",
     "fetch_token",
     "parse_plant",
     "refresh_token",

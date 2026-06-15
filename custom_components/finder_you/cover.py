@@ -1,7 +1,15 @@
 """Cover entity for each Finder YOU roller shutter."""
 from __future__ import annotations
 
+import time
 from typing import Any
+
+# How long after a command to prefer the commanded position over the
+# observed one. The gateway's plant cache lags 30–60 s behind a command,
+# so within this window the observed value is unreliable. After the window,
+# observed wins, which lets external state changes (wall switch, app)
+# propagate.
+RECENT_COMMAND_WINDOW = 60.0
 
 from homeassistant.components.cover import (
     ATTR_POSITION,
@@ -11,13 +19,12 @@ from homeassistant.components.cover import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import GatewayOfflineError, Shutter
+from .api import Shutter
 from .const import DOMAIN
 from .coordinator import FinderYouCoordinator
 
@@ -62,6 +69,7 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity, Resto
             suggested_area=shutter.room,
         )
         self._last_commanded_position: int = 100
+        self._last_command_at: float = 0.0
 
     async def async_added_to_hass(self) -> None:
         """Restore the last commanded position from before HA restarted.
@@ -81,7 +89,25 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity, Resto
 
     @property
     def current_cover_position(self) -> int | None:
-        observed = self.coordinator.data.get(self._shutter.uuid) if self.coordinator.data else None
+        """Return the observed plant position, with a recent-command override.
+
+        The gateway's plant cache lags 30–60 s behind a successful command,
+        so reporting the observed value right after a user action makes
+        HomeKit show "Closing…" forever (target=0, observed=stale). For
+        the brief recent-command window we prefer the commanded value;
+        outside that window observed wins, which lets external state
+        changes (wall switch, BTicino app) propagate at the scan interval.
+        """
+        observed = (
+            self.coordinator.data.get(self._shutter.uuid)
+            if self.coordinator.data
+            else None
+        )
+        within_command_window = (
+            time.time() - self._last_command_at < RECENT_COMMAND_WINDOW
+        )
+        if within_command_window:
+            return self._last_commanded_position
         return observed if observed is not None else self._last_commanded_position
 
     @property
@@ -92,16 +118,9 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity, Resto
         return pos == 0
 
     async def _send(self, op, target_position: int) -> None:
-        try:
-            await op()
-        except GatewayOfflineError as err:
-            # Coordinator verified the gateway never reflected the command
-            # in plant state across multiple attempts. Don't lie to HomeKit.
-            raise HomeAssistantError(
-                f"YESLY gateway didn't acknowledge the {self._shutter.name} "
-                f"command after retries ({err}). Check the gateway is online."
-            ) from err
+        await op()
         self._last_commanded_position = target_position
+        self._last_command_at = time.time()
         self.async_write_ha_state()
 
     async def async_open_cover(self, **kwargs: Any) -> None:

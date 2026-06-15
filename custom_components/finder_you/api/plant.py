@@ -12,6 +12,15 @@ from .proto import parse_fields
 
 SHUTTER_TYPE_MARKER = b"device_roller_shutter_50"
 
+# Per-shutter state submessage shape: the GetPlant payload contains one
+# device-state message per shutter, attached at depth 1 under field 12
+# of the plant wrapper. Each carries the shutter UUID at #1, plant UUID
+# at #2, MAC at #4, a config JSON blob at #6, last-update timestamp at
+# #7, gateway UUID at #8, signal at #9, motion flag at #12 (varint 2 =
+# idle, 3 = moving), and the open percentage at #13.#1. The field-id set
+# is stable, so we can identify these messages by their schema.
+_STATE_FIELD_SET = frozenset({1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13})
+
 
 @dataclass(frozen=True)
 class Shutter:
@@ -76,6 +85,70 @@ def _walk(payload: bytes, out: list[Shutter]) -> None:
             if shutter is not None:
                 out.append(shutter)
             _walk(v, out)
+
+
+def extract_shutter_states(payload: bytes) -> dict[str, bytes]:
+    """Return ``{shutter_uuid: state_submessage_bytes}`` for verification.
+
+    The state submessage contains UUID, position, motion flag, RSSI, and a
+    timestamp that updates on every event. Diffing the whole submessage is
+    therefore a reliable "did *this* shutter change?" signal that doesn't
+    cross-contaminate when other shutters are moving concurrently — that
+    was the bug behind the prior whole-payload approach.
+
+    Returns ``{}`` on a malformed payload rather than raising; the caller
+    falls back to whole-payload diff in that case.
+    """
+    out: dict[str, bytes] = {}
+    for sub, fields in _iter_state_submessages(payload):
+        uuid_b = fields.get(1, [None])[0]
+        if not isinstance(uuid_b, bytes) or len(uuid_b) != 36:
+            continue
+        out[uuid_b.decode()] = sub
+    return out
+
+
+def extract_shutter_positions(payload: bytes) -> dict[str, int]:
+    """Return ``{shutter_uuid: open_percent}`` from a GetPlant response."""
+    out: dict[str, int] = {}
+    for _sub, fields in _iter_state_submessages(payload):
+        uuid_b = fields.get(1, [None])[0]
+        if not isinstance(uuid_b, bytes) or len(uuid_b) != 36:
+            continue
+        pos_msg = fields.get(13, [None])[0]
+        if not isinstance(pos_msg, bytes):
+            continue
+        try:
+            pos_fields = parse_fields(pos_msg)
+        except Exception:
+            continue
+        pos = pos_fields.get(1, [None])[0]
+        if isinstance(pos, int) and 0 <= pos <= 100:
+            out[uuid_b.decode()] = pos
+    return out
+
+
+def _iter_state_submessages(payload: bytes):
+    """Yield ``(submessage_bytes, parsed_fields_dict)`` for each shutter.
+
+    We scan only the depth-1 submessages attached at field 12 of the plant
+    wrapper, filtered by the stable field-id schema (avoids accidentally
+    matching unrelated messages that happen to share a few fields).
+    """
+    try:
+        top = parse_fields(payload)
+    except Exception:
+        return
+    for sub in top.get(12, []):
+        if not isinstance(sub, bytes):
+            continue
+        try:
+            sub_fields = parse_fields(sub)
+        except Exception:
+            continue
+        if set(sub_fields.keys()) != _STATE_FIELD_SET:
+            continue
+        yield sub, sub_fields
 
 
 def _extract(room_bytes: bytes) -> Shutter | None:
