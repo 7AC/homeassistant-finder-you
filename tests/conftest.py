@@ -5,6 +5,7 @@ enable custom-integration discovery so the ``finder_you`` package under
 ``custom_components/`` is importable from inside HA test runs without
 needing to be installed.
 """
+
 from __future__ import annotations
 
 import pytest

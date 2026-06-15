@@ -1,15 +1,9 @@
 """Cover entity for each Finder YOU roller shutter."""
+
 from __future__ import annotations
 
 import time
 from typing import Any
-
-# How long after a command to prefer the commanded position over the
-# observed one. The gateway's plant cache lags 30–60 s behind a command,
-# so within this window the observed value is unreliable. After the window,
-# observed wins, which lets external state changes (wall switch, app)
-# propagate.
-RECENT_COMMAND_WINDOW = 60.0
 
 from homeassistant.components.cover import (
     ATTR_POSITION,
@@ -28,6 +22,13 @@ from .api import Shutter
 from .const import DOMAIN
 from .coordinator import FinderYouCoordinator
 
+# How long after a command to prefer the commanded position over the
+# observed one. The gateway's plant cache lags 30–60 s behind a command,
+# so within this window the observed value is unreliable. After the window,
+# observed wins, which lets external state changes (wall switch, app)
+# propagate.
+RECENT_COMMAND_WINDOW = 60.0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -37,18 +38,14 @@ async def async_setup_entry(
     coordinator: FinderYouCoordinator = hass.data[DOMAIN][entry.entry_id]
     # First refresh populates the shutter list.
     await coordinator.async_config_entry_first_refresh()
-    async_add_entities(
-        FinderYouCover(coordinator, shutter) for shutter in coordinator.shutters
-    )
+    async_add_entities(FinderYouCover(coordinator, shutter) for shutter in coordinator.shutters)
 
 
 class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity, RestoreEntity):
     _attr_has_entity_name = True
     _attr_device_class = CoverDeviceClass.SHUTTER
     _attr_supported_features = (
-        CoverEntityFeature.OPEN
-        | CoverEntityFeature.CLOSE
-        | CoverEntityFeature.SET_POSITION
+        CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.SET_POSITION
     )
     # The cloud's reply to SetOpenPercent is a synchronous ack — the gateway
     # drives the motor asynchronously and v1 has no real-time position
@@ -98,14 +95,8 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity, Resto
         outside that window observed wins, which lets external state
         changes (wall switch, BTicino app) propagate at the scan interval.
         """
-        observed = (
-            self.coordinator.data.get(self._shutter.uuid)
-            if self.coordinator.data
-            else None
-        )
-        within_command_window = (
-            time.time() - self._last_command_at < RECENT_COMMAND_WINDOW
-        )
+        observed = self.coordinator.data.get(self._shutter.uuid) if self.coordinator.data else None
+        within_command_window = time.time() - self._last_command_at < RECENT_COMMAND_WINDOW
         if within_command_window:
             return self._last_commanded_position
         return observed if observed is not None else self._last_commanded_position
@@ -124,17 +115,11 @@ class FinderYouCover(CoordinatorEntity[FinderYouCoordinator], CoverEntity, Resto
         self.async_write_ha_state()
 
     async def async_open_cover(self, **kwargs: Any) -> None:
-        await self._send(
-            lambda: self.coordinator.async_open(self._shutter.uuid), 100
-        )
+        await self._send(lambda: self.coordinator.async_open(self._shutter.uuid), 100)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
-        await self._send(
-            lambda: self.coordinator.async_close_shutter(self._shutter.uuid), 0
-        )
+        await self._send(lambda: self.coordinator.async_close_shutter(self._shutter.uuid), 0)
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         pos = kwargs[ATTR_POSITION]
-        await self._send(
-            lambda: self.coordinator.async_set_position(self._shutter.uuid, pos), pos
-        )
+        await self._send(lambda: self.coordinator.async_set_position(self._shutter.uuid, pos), pos)

@@ -5,6 +5,7 @@ gRPC service. Mints tokens via the Android-style OAuth flow and maintains
 a persistent HTTP/2 connection with Android-exact framing so the gateway
 accepts our control commands.
 """
+
 from .client import FinderApiError, FinderHomeClient, GatewayOfflineError
 from .oauth import OAuthError, fetch_token, refresh_token
 from .plant import (

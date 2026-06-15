@@ -52,6 +52,11 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          # 'topics' requires the repo to have descriptive topics set on
+          # GitHub; 'brands' requires assets in the HA brands repo. Both
+          # are publish-readiness checks rather than code-correctness
+          # ones, so we don't gate CI on them.
+          ignore: topics brands
 
   hassfest:
     name: Hassfest (HA manifest checks)

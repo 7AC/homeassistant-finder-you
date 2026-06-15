@@ -1,4 +1,5 @@
 """Tests for the OAuth flow (mocked HTTP via respx)."""
+
 from __future__ import annotations
 
 import urllib.parse
@@ -37,9 +38,7 @@ def _mount_authorize_ok(mocker, return_url="/connect/authorize/callback?abc"):
 
 def _mount_signin_ok(mocker, next_url="/connect/authorize/callback?xyz"):
     mocker.post(f"{ACCOUNTS_BASE}/_api/v1/auth/signin-oidc").mock(
-        return_value=httpx.Response(
-            200, json={"result": "OK", "data": {"next": next_url}}
-        )
+        return_value=httpx.Response(200, json={"result": "OK", "data": {"next": next_url}})
     )
 
 
@@ -47,9 +46,7 @@ def _mount_callback_ok(mocker, code="ABC123"):
     mocker.get(f"{ACCOUNTS_BASE}/connect/authorize/callback").mock(
         return_value=httpx.Response(
             302,
-            headers={
-                "location": f"finderyou://auth?{urllib.parse.urlencode({'code': code})}"
-            },
+            headers={"location": f"finderyou://auth?{urllib.parse.urlencode({'code': code})}"},
         )
     )
 
@@ -91,9 +88,7 @@ async def test_fetch_token_happy_path():
 
 async def test_fetch_token_authorize_not_302():
     with respx.mock() as mocker:
-        mocker.get(f"{ACCOUNTS_BASE}/connect/authorize").mock(
-            return_value=httpx.Response(500)
-        )
+        mocker.get(f"{ACCOUNTS_BASE}/connect/authorize").mock(return_value=httpx.Response(500))
         with pytest.raises(OAuthError, match="authorize step failed"):
             await fetch_token("u", "p")
 
@@ -167,7 +162,9 @@ async def test_fetch_token_authorize_missing_location_header():
 
 async def test_refresh_token_happy_path():
     with respx.mock() as mocker:
-        _mount_token_ok(mocker, body={"access_token": "T2", "refresh_token": "R2", "expires_in": 60})
+        _mount_token_ok(
+            mocker, body={"access_token": "T2", "refresh_token": "R2", "expires_in": 60}
+        )
         tok = await refresh_token("old")
     assert tok["access_token"] == "T2"
 

@@ -3,10 +3,11 @@
 We mock the FinderHomeClient and OAuth helpers, so each test runs in
 process without touching the network.
 """
+
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant.helpers.update_coordinator import UpdateFailed
@@ -86,7 +87,9 @@ async def test_ensure_token_falls_back_to_fresh_when_refresh_fails(coord, monkey
 
 
 async def test_ensure_client_runs_handshake_and_captures_plant_id(coord, monkeypatch):
-    monkeypatch.setattr(mod, "fetch_token", AsyncMock(return_value={"access_token": "T", "expires_in": 60}))
+    monkeypatch.setattr(
+        mod, "fetch_token", AsyncMock(return_value={"access_token": "T", "expires_in": 60})
+    )
     fake_client = AsyncMock()
     inner = field_string(1, b"plant-99")
     fake_client.handshake = AsyncMock(return_value={3: [inner]})
@@ -103,7 +106,9 @@ async def test_ensure_client_runs_handshake_and_captures_plant_id(coord, monkeyp
 
 
 async def test_ensure_client_skips_plant_id_when_no_field_3(coord, monkeypatch):
-    monkeypatch.setattr(mod, "fetch_token", AsyncMock(return_value={"access_token": "T", "expires_in": 60}))
+    monkeypatch.setattr(
+        mod, "fetch_token", AsyncMock(return_value={"access_token": "T", "expires_in": 60})
+    )
     fake_client = AsyncMock()
     fake_client.handshake = AsyncMock(return_value={})
     monkeypatch.setattr(
@@ -116,7 +121,9 @@ async def test_ensure_client_skips_plant_id_when_no_field_3(coord, monkeypatch):
 
 
 async def test_ensure_client_closes_partial_client_on_handshake_failure(coord, monkeypatch):
-    monkeypatch.setattr(mod, "fetch_token", AsyncMock(return_value={"access_token": "T", "expires_in": 60}))
+    monkeypatch.setattr(
+        mod, "fetch_token", AsyncMock(return_value={"access_token": "T", "expires_in": 60})
+    )
     fake_client = AsyncMock()
     fake_client.handshake = AsyncMock(side_effect=RuntimeError("boom"))
     monkeypatch.setattr(
@@ -130,7 +137,9 @@ async def test_ensure_client_closes_partial_client_on_handshake_failure(coord, m
 
 
 async def test_ensure_client_swallows_close_errors_during_cleanup(coord, monkeypatch):
-    monkeypatch.setattr(mod, "fetch_token", AsyncMock(return_value={"access_token": "T", "expires_in": 60}))
+    monkeypatch.setattr(
+        mod, "fetch_token", AsyncMock(return_value={"access_token": "T", "expires_in": 60})
+    )
     fake_client = AsyncMock()
     fake_client.handshake = AsyncMock(side_effect=RuntimeError("boom"))
     fake_client.close = AsyncMock(side_effect=RuntimeError("nested"))
@@ -203,9 +212,7 @@ async def test_run_or_reconnect_reconnects_on_other_error(coord, monkeypatch):
 # ---- _async_update_data ---------------------------------------------------
 
 
-async def test_update_data_with_plant_id_parses_shutters_and_positions(
-    coord, monkeypatch
-):
+async def test_update_data_with_plant_id_parses_shutters_and_positions(coord, monkeypatch):
     coord._plant_id = b"PID"
 
     async def fake_run(fn):
@@ -213,12 +220,11 @@ async def test_update_data_with_plant_id_parses_shutters_and_positions(
 
     monkeypatch.setattr(coord, "_run_or_reconnect", fake_run)
     monkeypatch.setattr(
-        mod, "parse_plant",
+        mod,
+        "parse_plant",
         lambda payload: ("Casa", [Shutter("u1", "S1"), Shutter("u2", "S2")]),
     )
-    monkeypatch.setattr(
-        mod, "extract_shutter_positions", lambda payload: {"u1": 45, "u2": 0}
-    )
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda payload: {"u1": 45, "u2": 0})
     out = await coord._async_update_data()
     assert out == {"u1": 45, "u2": 0}
     assert coord.plant_name == "Casa"
@@ -232,9 +238,7 @@ async def test_update_data_missing_position_returns_none(coord, monkeypatch):
         return b"raw-plant"
 
     monkeypatch.setattr(coord, "_run_or_reconnect", fake_run)
-    monkeypatch.setattr(
-        mod, "parse_plant", lambda p: ("Casa", [Shutter("u1", "S1")])
-    )
+    monkeypatch.setattr(mod, "parse_plant", lambda p: ("Casa", [Shutter("u1", "S1")]))
     monkeypatch.setattr(mod, "extract_shutter_positions", lambda p: {})
     out = await coord._async_update_data()
     assert out == {"u1": None}
@@ -289,7 +293,7 @@ async def test_update_data_raises_update_failed_on_known_errors(coord, monkeypat
 
 @pytest.mark.parametrize(
     "exc",
-    [ConnectionError("c"), OAuthError("o"), asyncio.TimeoutError(), OSError("o")],
+    [ConnectionError("c"), OAuthError("o"), TimeoutError(), OSError("o")],
 )
 async def test_update_data_other_known_errors_raise_update_failed(coord, monkeypatch, exc):
     coord._plant_id = b"PID"

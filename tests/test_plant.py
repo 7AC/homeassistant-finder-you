@@ -1,4 +1,5 @@
 """Tests for ``api/plant.py`` -- GetPlant payload parsing."""
+
 from __future__ import annotations
 
 from custom_components.finder_you.api.plant import (
@@ -11,7 +12,6 @@ from custom_components.finder_you.api.plant import (
     parse_plant,
 )
 from custom_components.finder_you.api.proto import field_string, field_varint
-
 
 # ---- Tiny fixture helpers --------------------------------------------------
 
@@ -121,9 +121,7 @@ def test_extract_returns_none_when_name_not_bytes():
     # name field present but as varint (wire mismatch) -> not bytes -> None
     type_msg = field_string(1, SHUTTER_TYPE_MARKER)
     room = (
-        field_string(2, field_string(1, b"u" * 36))
-        + field_varint(7, 1)
-        + field_string(8, type_msg)
+        field_string(2, field_string(1, b"u" * 36)) + field_varint(7, 1) + field_string(8, type_msg)
     )
     assert _extract(room) is None
 

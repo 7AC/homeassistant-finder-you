@@ -1,4 +1,5 @@
 """OAuth flow against accounts.iot.findernet.com — Android-style, no PKCE."""
+
 from __future__ import annotations
 
 import asyncio
@@ -9,9 +10,7 @@ import httpx
 
 ACCOUNTS_BASE = "https://accounts.iot.findernet.com"
 CLIENT_ID = "com.findernet.You"
-SCOPE = (
-    "openid email profile offline_access api.v1 finder:role finder:language"
-)
+SCOPE = "openid email profile offline_access api.v1 finder:role finder:language"
 REDIRECT_URI = "finderyou://auth"
 ANDROID_UA = (
     "Mozilla/5.0 (Linux; Android 14; sdk_gphone64_arm64 Build/UE1A.230829.050; wv) "
@@ -59,14 +58,12 @@ async def fetch_token(username: str, password: str) -> dict:
             "scope": SCOPE,
             "redirect_uri": REDIRECT_URI,
         }
-        r = await client.get(
-            f"{ACCOUNTS_BASE}/connect/authorize?" + urllib.parse.urlencode(params)
-        )
+        r = await client.get(f"{ACCOUNTS_BASE}/connect/authorize?" + urllib.parse.urlencode(params))
         if r.status_code != 302 or "location" not in r.headers:
             raise OAuthError(f"authorize step failed: {r.status_code}")
-        return_url = urllib.parse.parse_qs(
-            urllib.parse.urlparse(r.headers["location"]).query
-        )["returnUrl"][0]
+        return_url = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)[
+            "returnUrl"
+        ][0]
 
         # 2. /_api/v1/auth/signin-oidc with creds. Cookies issued.
         r = await client.post(
@@ -97,9 +94,7 @@ async def fetch_token(username: str, password: str) -> dict:
         r = await client.get(cb_url, follow_redirects=False)
         if r.status_code != 302:
             raise OAuthError(f"callback didn't redirect: {r.status_code}")
-        code = urllib.parse.parse_qs(
-            urllib.parse.urlparse(r.headers["location"]).query
-        )["code"][0]
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)["code"][0]
 
         # 4. Exchange code for access_token. No code_verifier — Android client
         #    is configured without PKCE.
@@ -140,9 +135,7 @@ async def refresh_token(refresh: str) -> dict:
             },
         )
         if r.status_code != 200:
-            raise OAuthError(
-                f"refresh failed: {r.status_code} {r.text[:200]}"
-            )
+            raise OAuthError(f"refresh failed: {r.status_code} {r.text[:200]}")
         token = r.json()
         if "access_token" not in token:
             raise OAuthError(f"refresh missing access_token: {token}")

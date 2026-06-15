@@ -2,6 +2,7 @@
 plant for shutter state at a fixed interval. Commands flow through the same
 connection so they share the gateway claim established by the boot
 sequence."""
+
 from __future__ import annotations
 
 import asyncio
@@ -105,6 +106,7 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
             # of the inner Plant message (field 3 of the wrapper).
             if 3 in plants_msg:
                 from .api.proto import parse_fields  # local import to avoid cycle
+
                 inner = parse_fields(plants_msg[3][0])
                 self._plant_id = inner.get(1, [b""])[0]
         except Exception:
@@ -152,7 +154,7 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
             plant_payload = await self._run_or_reconnect(
                 lambda c: c.get_plant(self._plant_id) if self._plant_id else c.handshake()
             )
-        except (FinderApiError, ConnectionError, OAuthError, asyncio.TimeoutError, OSError) as err:
+        except (TimeoutError, FinderApiError, ConnectionError, OAuthError, OSError) as err:
             await self._drop_client()
             raise UpdateFailed(str(err)) from err
 
@@ -203,6 +205,7 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         position to land in HA, instead of waiting up to a full scan
         interval for the periodic poll.
         """
+
         async def delayed() -> None:
             try:
                 await asyncio.sleep(POST_COMMAND_REFRESH_DELAY)

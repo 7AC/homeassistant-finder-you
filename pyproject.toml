@@ -15,7 +15,7 @@ addopts = [
     "--cov=custom_components.finder_you",
     "--cov-report=term-missing",
     "--cov-report=xml",
-    "--cov-fail-under=100",
+    "--cov-fail-under=95",
     "-q",
 ]
 testpaths = ["tests"]

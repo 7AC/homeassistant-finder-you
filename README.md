@@ -32,11 +32,16 @@ the Finder cloud so commands reach your gateway promptly.
 
 ## Known limits in v0.1
 
-- **No position feedback** — `cover.current_cover_position` reports
-  `unknown`. Commands still work. State decode lands when we finish parsing
-  the `OpenNotificationChannel` stream messages.
-- **No scenarios** — control individual blinds; build "all open" /
-  "all closed" macros with Apple Home or HA automations.
+- **No native scenarios** — control individual blinds and build
+  "all open" / "all closed" macros with Apple Home scenes or HA
+  automations. Concurrent fan-outs are serialized internally with a
+  small inter-command gap so the YESLY gateway doesn't drop commands
+  under burst load.
+- **Position lags after a command** — the cloud plant-state cache
+  takes 30–60 s to reflect a command, so the cover reports the
+  commanded target during that window and reconciles with the
+  observed position afterwards. Wall-switch / app changes still
+  propagate at the scan interval.
 
 ---
 

@@ -1,4 +1,5 @@
 """Config flow for Finder YOU: email + password."""
+
 from __future__ import annotations
 
 import logging
@@ -24,9 +25,7 @@ USER_SCHEMA = vol.Schema(
 class FinderYouConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
             await self.async_set_unique_id(user_input[CONF_EMAIL].lower())
@@ -44,6 +43,4 @@ class FinderYouConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     title=f"Finder YOU ({user_input[CONF_EMAIL]})",
                     data=user_input,
                 )
-        return self.async_show_form(
-            step_id="user", data_schema=USER_SCHEMA, errors=errors
-        )
+        return self.async_show_form(step_id="user", data_schema=USER_SCHEMA, errors=errors)

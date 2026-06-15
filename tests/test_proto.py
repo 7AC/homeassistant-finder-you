@@ -1,4 +1,5 @@
 """Tests for the minimal protobuf encoder/decoder."""
+
 from __future__ import annotations
 
 import pytest
@@ -91,9 +92,7 @@ def test_build_client_info_defaults():
 
 
 def test_build_client_info_custom_kwargs():
-    blob = build_client_info(
-        b"uuid", version=144, platform=b"X", app_version=b"9.9", device=b"D"
-    )
+    blob = build_client_info(b"uuid", version=144, platform=b"X", app_version=b"9.9", device=b"D")
     f = parse_fields(blob)
     assert f[2] == [144]
     assert f[3] == [b"X"]

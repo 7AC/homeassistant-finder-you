@@ -1,4 +1,5 @@
 """Constants module — touch every line for coverage."""
+
 from custom_components.finder_you import const
 
 

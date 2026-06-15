@@ -5,6 +5,7 @@ unit tests, but the dispatcher, framing helpers, error types, and the
 per-shutter notification waiter mechanism are all in-process state we
 can exercise directly.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +16,6 @@ import pytest
 
 from custom_components.finder_you.api.client import (
     FLAG_ACK,
-    FLAG_END_HEADERS,
     FLAG_END_STREAM,
     H2_PREFACE,
     TYPE_DATA,
@@ -34,7 +34,6 @@ from custom_components.finder_you.api.proto import (
     field_varint,
     parse_fields,
 )
-
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -310,9 +309,7 @@ async def test_call_raises_when_field_1_says_error():
 
     async def fake_drain():
         payload = field_varint(1, 2) + field_varint(2, 19)
-        c._finalize_stream(
-            1, bytes([0]) + struct.pack(">L", len(payload)) + payload, 0
-        )
+        c._finalize_stream(1, bytes([0]) + struct.pack(">L", len(payload)) + payload, 0)
 
     c._writer.drain.side_effect = fake_drain
     with pytest.raises(FinderApiError) as exc:
@@ -404,7 +401,6 @@ async def test_notification_keepalive_resends_then_exits_on_writer_none():
 
     # Patch asyncio.sleep so the 30 s loop runs instantly and we can flip
     # _writer to None after the first iteration.
-    real_sleep = asyncio.sleep
     calls = {"n": 0}
 
     async def fake_sleep(_t):
@@ -715,7 +711,6 @@ async def test_read_loop_drops_done_pending_silently():
 
 
 async def test_classmethod_connect_runs_connect():
-    c = FinderHomeClient("tok")
     # We can't run the real _connect (it talks to the cloud), but we can
     # verify the classmethod calls it. Patch _connect.
     with patch.object(FinderHomeClient, "_connect", new=AsyncMock()) as p:

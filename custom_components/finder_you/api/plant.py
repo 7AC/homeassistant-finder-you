@@ -4,6 +4,7 @@ The plant payload is ~27 KB of nested protobuf. We only need the list of
 roller shutters: their UUID (used by SetOpenPercent) and their display
 name.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

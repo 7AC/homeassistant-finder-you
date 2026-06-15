@@ -1,4 +1,5 @@
 """Constants for the Finder YOU integration."""
+
 from __future__ import annotations
 
 DOMAIN = "finder_you"

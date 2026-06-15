@@ -1,4 +1,5 @@
 """Tests for the FinderYouCover entity."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -72,9 +73,7 @@ async def test_added_to_hass_restores_int_position(hass):
 
     restored = MagicMock()
     restored.attributes = {"current_position": 42}
-    with patch.object(
-        FinderYouCover, "async_get_last_state", new=AsyncMock(return_value=restored)
-    ):
+    with patch.object(FinderYouCover, "async_get_last_state", new=AsyncMock(return_value=restored)):
         await e.async_added_to_hass()
     assert e._last_commanded_position == 42
 
@@ -83,9 +82,7 @@ async def test_added_to_hass_with_no_last_state_uses_default(hass):
     coord = _make_coord()
     e = FinderYouCover(coord, Shutter("u1", "S1"))
     e.hass = hass
-    with patch.object(
-        FinderYouCover, "async_get_last_state", new=AsyncMock(return_value=None)
-    ):
+    with patch.object(FinderYouCover, "async_get_last_state", new=AsyncMock(return_value=None)):
         await e.async_added_to_hass()
     assert e._last_commanded_position == 100  # default
 
@@ -96,9 +93,7 @@ async def test_added_to_hass_ignores_non_numeric_position(hass):
     e.hass = hass
     restored = MagicMock()
     restored.attributes = {"current_position": "not a number"}
-    with patch.object(
-        FinderYouCover, "async_get_last_state", new=AsyncMock(return_value=restored)
-    ):
+    with patch.object(FinderYouCover, "async_get_last_state", new=AsyncMock(return_value=restored)):
         await e.async_added_to_hass()
     assert e._last_commanded_position == 100
 
@@ -121,6 +116,7 @@ def test_position_prefers_commanded_inside_command_window():
     coord = _make_coord(data={"uuid-1": 100})
     e = FinderYouCover(coord, Shutter("uuid-1", "S"))
     import time
+
     e._last_commanded_position = 0
     e._last_command_at = time.time()  # just now
     assert e.current_cover_position == 0
@@ -154,9 +150,7 @@ def test_is_closed_returns_none_when_no_position_at_all():
     coord = _make_coord()
     e = FinderYouCover(coord, Shutter("uuid-1", "S"))
     # Force the property to return None.
-    with patch.object(
-        FinderYouCover, "current_cover_position", new=property(lambda self: None)
-    ):
+    with patch.object(FinderYouCover, "current_cover_position", new=property(lambda self: None)):
         assert e.is_closed is None
 
 
@@ -193,6 +187,7 @@ async def test_set_cover_position_updates_state(hass):
     e.entity_id = "cover.test"
     e.async_write_ha_state = MagicMock()
     import time
+
     before = time.time()
     await e.async_set_cover_position(**{ATTR_POSITION: 55})
     coord.async_set_position.assert_called_once_with("uuid-1", 55)
@@ -200,4 +195,3 @@ async def test_set_cover_position_updates_state(hass):
     # Timestamp is captured so the position property knows we're inside the
     # recent-command window and should report the commanded target.
     assert e._last_command_at >= before
-

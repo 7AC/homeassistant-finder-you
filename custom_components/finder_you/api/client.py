@@ -8,15 +8,14 @@ Why raw HTTP/2 instead of grpc-python: the server rejects requests with
 - run every other RPC on the same TCP+TLS+HTTP/2 connection
 to be accepted as the "live" client by the gateway router.
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
-import socket
 import ssl
 import struct
 import uuid
-from typing import Any
 
 import hpack
 
@@ -108,7 +107,7 @@ class FinderHomeClient:
         self._shutter_waiters: dict[str, list[asyncio.Future]] = {}
 
     @classmethod
-    async def connect(cls, token: str) -> "FinderHomeClient":
+    async def connect(cls, token: str) -> FinderHomeClient:
         """Open the connection and run the Android-style handshake."""
         self = cls(token)
         await self._connect()
@@ -284,7 +283,7 @@ class FinderHomeClient:
         self._shutter_waiters.setdefault(key, []).append(fut)
         try:
             await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError as err:
+        except TimeoutError as err:
             # Clean up our entry so a late notification doesn't pop a stale future.
             waiters = self._shutter_waiters.get(key)
             if waiters and fut in waiters:
@@ -328,8 +327,7 @@ class FinderHomeClient:
         fut: asyncio.Future[tuple[bytes, int]] = asyncio.get_event_loop().create_future()
         self._pending[sid] = fut
         self._writer.write(
-            self._build_headers_frame(method, sid, with_auth)
-            + self._build_data_frame(body, sid)
+            self._build_headers_frame(method, sid, with_auth) + self._build_data_frame(body, sid)
         )
         await self._writer.drain()
         payload, status = await asyncio.wait_for(fut, timeout=15)
@@ -374,7 +372,7 @@ class FinderHomeClient:
         await self._writer.drain()
         try:
             await asyncio.wait_for(self._notification_queue.get(), timeout=3)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _LOGGER.warning("no claim ack on first notification msg within 3s")
 
         # Send a PING — Android does this between msg 1 and msg 2.
@@ -389,14 +387,12 @@ class FinderHomeClient:
         # Server replies "10 01 40 01" — the field 8 (= 0x40) addition is
         # the "you're now the authoritative client" signal.
         subscribe_client = ci_payload + field_varint(2, 1)
-        self._writer.write(
-            self._build_data_frame(subscribe_client, sid, end_stream=False)
-        )
+        self._writer.write(self._build_data_frame(subscribe_client, sid, end_stream=False))
         await self._writer.drain()
         try:
             resp = await asyncio.wait_for(self._notification_queue.get(), timeout=3)
             _LOGGER.info("subscribe-client response: %s", resp.hex())
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _LOGGER.warning("no claim ack on subscribe-client within 3s")
 
         # Now run the bootstrap RPCs. Per the Frida-captured Android flow,
@@ -416,12 +412,8 @@ class FinderHomeClient:
                 # subscribe-plant message is itself a message whose inner
                 # field 1 is the plant_id string.
                 plant_envelope = field_string(1, plant_id)
-                subscribe_plant = (
-                    ci_payload + field_varint(2, 2) + field_string(3, plant_envelope)
-                )
-                self._writer.write(
-                    self._build_data_frame(subscribe_plant, sid, end_stream=False)
-                )
+                subscribe_plant = ci_payload + field_varint(2, 2) + field_string(3, plant_envelope)
+                self._writer.write(self._build_data_frame(subscribe_plant, sid, end_stream=False))
                 await self._writer.drain()
                 # Wait for plant-subscribe response — Android receives a
                 # large plant-state payload after this; we just need to know
@@ -429,7 +421,7 @@ class FinderHomeClient:
                 try:
                     resp = await asyncio.wait_for(self._notification_queue.get(), timeout=5)
                     _LOGGER.info("subscribe-plant response (%d B): %s", len(resp), resp[:60].hex())
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     _LOGGER.warning("no subscribe-plant response within 5s")
 
         # Keepalive: re-send subscribe-client every 30 s to hold the claim.
@@ -495,7 +487,7 @@ class FinderHomeClient:
             except Exception:
                 pass
 
-    async def __aenter__(self) -> "FinderHomeClient":
+    async def __aenter__(self) -> FinderHomeClient:
         return self
 
     async def __aexit__(self, *exc) -> None:

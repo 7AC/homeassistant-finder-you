@@ -3,6 +3,7 @@
 Only what we need to encode Finder YOU gRPC request bodies and decode responses —
 no full protoc dependency.
 """
+
 from __future__ import annotations
 
 

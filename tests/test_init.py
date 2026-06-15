@@ -1,4 +1,5 @@
 """Tests for the integration setup/unload entry points."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
@@ -45,9 +46,7 @@ async def _setup(hass, entry):
     `hass.config_entries.async_setup` handles that, but we're testing our
     own setup function directly, so we patch the forward to a no-op.
     """
-    with patch.object(
-        hass.config_entries, "async_forward_entry_setups", AsyncMock()
-    ):
+    with patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()):
         return await async_setup_entry(hass, entry)
 
 
@@ -65,9 +64,7 @@ async def test_unload_entry_pops_coordinator_and_shuts_down(hass, fake_coordinat
     await _setup(hass, entry)
 
     # Force the platform-unload helper to claim success so the pop path runs.
-    with patch.object(
-        hass.config_entries, "async_unload_platforms", AsyncMock(return_value=True)
-    ):
+    with patch.object(hass.config_entries, "async_unload_platforms", AsyncMock(return_value=True)):
         assert await async_unload_entry(hass, entry)
 
     assert entry.entry_id not in hass.data.get(DOMAIN, {})
@@ -79,9 +76,7 @@ async def test_unload_entry_keeps_coordinator_when_platforms_fail(hass, fake_coo
     entry.add_to_hass(hass)
     await _setup(hass, entry)
 
-    with patch.object(
-        hass.config_entries, "async_unload_platforms", AsyncMock(return_value=False)
-    ):
+    with patch.object(hass.config_entries, "async_unload_platforms", AsyncMock(return_value=False)):
         assert not await async_unload_entry(hass, entry)
 
     # Still registered because unload didn't succeed.
