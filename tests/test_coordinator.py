@@ -7,7 +7,7 @@ process without touching the network.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.helpers.update_coordinator import UpdateFailed
@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from custom_components.finder_you import coordinator as mod
 from custom_components.finder_you.api import (
     FinderApiError,
+    GatewayOfflineError,
     OAuthError,
     Shutter,
 )
@@ -307,42 +308,76 @@ async def test_update_data_other_known_errors_raise_update_failed(coord, monkeyp
         await coord._async_update_data()
 
 
-# ---- _send_command: the serialization + pacing lock + delayed refresh -----
+# ---- _send_command: serialization + verify-by-plant-diff -----------------
 
 
-async def _patch_refresh_to_noop(coord, monkeypatch):
-    """Replace the post-command refresh with a sync no-op so tests don't
-    have to wait POST_COMMAND_REFRESH_DELAY seconds."""
-    coord._schedule_post_command_refresh = lambda: None  # type: ignore[assignment]
+def _verify_stub(extract_calls, slice_sequence):
+    """Build an extract_shutter_states replacement driven by a sequence.
+
+    Each call returns ``{"u1": slice_sequence[i]}`` (or ``{}`` if None),
+    so the test can script exactly what each verify poll observes.
+    """
+    iterator = iter(slice_sequence)
+
+    def fake_extract(_payload):
+        try:
+            sl = next(iterator)
+        except StopIteration:
+            return {}
+        extract_calls.append(sl)
+        return {"u1": sl} if sl is not None else {}
+
+    return fake_extract
 
 
 async def test_send_command_waits_between_consecutive_sends(coord, monkeypatch):
     """Two back-to-back sends must be spaced by at least COMMAND_SEND_GAP."""
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.05)
-    await _patch_refresh_to_noop(coord, monkeypatch)
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
 
-    timestamps: list[float] = []
+    # Verify always succeeds instantly so we measure only the send-side gap.
+    async def fake_wait(*_args, **_kw):
+        return True
+
+    coord._wait_for_shutter_change = fake_wait  # type: ignore[assignment]
+
+    send_timestamps: list[float] = []
     loop = asyncio.get_event_loop()
+    send_count = {"n": 0}
 
     async def runner(fn):
-        timestamps.append(loop.time())
-        return await fn(MagicMock())
+        # Inside the send lock we do (1) baseline get_plant then (2) the
+        # actual do_call. The do_call is what we want to time-stamp.
+        send_count["n"] += 1
+        if send_count["n"] % 2 == 0:
+            send_timestamps.append(loop.time())
+            return await fn(AsyncMock())
+        return b"plant"
 
     coord._run_or_reconnect = runner  # type: ignore[assignment]
 
     async def noop(c):
         return None
 
-    await coord._send_command(noop)
-    await coord._send_command(noop)
-    assert len(timestamps) == 2
-    assert timestamps[1] - timestamps[0] >= 0.05 - 0.005
+    await coord._send_command("u1", noop)
+    await coord._send_command("u1", noop)
+    assert len(send_timestamps) == 2
+    assert send_timestamps[1] - send_timestamps[0] >= 0.05 - 0.005
 
 
 async def test_send_command_serializes_concurrent_callers(coord, monkeypatch):
     """The lock must prevent overlap, not just enforce the time gap."""
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
-    await _patch_refresh_to_noop(coord, monkeypatch)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.05)
+    # Every send sees a successful verify (baseline A, current B).
+    monkeypatch.setattr(
+        mod,
+        "extract_shutter_states",
+        _verify_stub([], [b"A", b"B"] * 10),
+    )
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+
     in_flight = 0
     max_in_flight = 0
 
@@ -352,26 +387,52 @@ async def test_send_command_serializes_concurrent_callers(coord, monkeypatch):
         max_in_flight = max(max_in_flight, in_flight)
         await asyncio.sleep(0.005)
         in_flight -= 1
-        return await fn(MagicMock())
+        return await fn(AsyncMock())
 
     coord._run_or_reconnect = runner  # type: ignore[assignment]
 
     async def noop(c):
         return None
 
-    await asyncio.gather(*(coord._send_command(noop) for _ in range(4)))
-    assert max_in_flight == 1
+    await asyncio.gather(*(coord._send_command("u1", noop) for _ in range(4)))
+    # The lock only guards baseline-get + send, not the verify polls, so
+    # the cap measures send-path concurrency. Verify polls fire outside
+    # the lock and can run in parallel with subsequent sends.
+    assert max_in_flight <= 2  # at most one send + one verify-poll mid-flight
 
 
-async def test_send_command_schedules_delayed_refresh(coord, monkeypatch):
-    """After a send, the coordinator must kick a follow-up refresh so the
-    real position propagates without waiting for the next scheduled scan."""
+async def test_send_command_raises_when_gateway_doesnt_act(coord, monkeypatch):
+    """If the plant slice never changes within VERIFY_TIMEOUT, the
+    coordinator must raise GatewayOfflineError so the cover translates
+    it into a HomeAssistantError and HomeKit reverts."""
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
-    # Fire the refresh after near-zero delay so the test runs fast.
-    monkeypatch.setattr(mod, "POST_COMMAND_REFRESH_DELAY", 0.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.01)
+    # Baseline A, every poll returns A → never changes.
+    monkeypatch.setattr(mod, "extract_shutter_states", _verify_stub([], [b"A"] * 100))
 
     async def runner(fn):
-        return await fn(MagicMock())
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    with pytest.raises(GatewayOfflineError):
+        await coord._send_command("u1", noop)
+
+
+async def test_send_command_succeeds_when_slice_changes(coord, monkeypatch):
+    """A normal successful command: baseline differs from a subsequent poll."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.1)
+    monkeypatch.setattr(mod, "extract_shutter_states", _verify_stub([], [b"A", b"B"]))
+
+    async def runner(fn):
+        return await fn(AsyncMock())
 
     coord._run_or_reconnect = runner  # type: ignore[assignment]
     refresh_calls = []
@@ -384,27 +445,29 @@ async def test_send_command_schedules_delayed_refresh(coord, monkeypatch):
     async def noop(c):
         return None
 
-    await coord._send_command(noop)
-    # The refresh runs in a hass.async_create_task — yield until it fires.
-    for _ in range(5):
-        await asyncio.sleep(0)
-        if refresh_calls:
-            break
+    await coord._send_command("u1", noop)
+    # On success the coordinator kicks an HA refresh.
     assert refresh_calls
 
 
-async def test_schedule_post_command_refresh_swallows_errors(coord, monkeypatch):
-    """If async_request_refresh raises, the delayed task must not crash HA."""
-    monkeypatch.setattr(mod, "POST_COMMAND_REFRESH_DELAY", 0.0)
+async def test_wait_for_shutter_change_skips_failed_polls(coord, monkeypatch):
+    """A transient error during a verify poll must be logged but not abort
+    the loop; subsequent polls keep trying."""
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.05)
+    call = {"n": 0}
 
-    async def boom():
-        raise RuntimeError("network died")
+    async def runner(fn):
+        call["n"] += 1
+        if call["n"] == 1:
+            raise RuntimeError("transient")
+        return b"plant"
 
-    coord.async_request_refresh = boom  # type: ignore[assignment]
-    coord._schedule_post_command_refresh()
-    # Yield to let the delayed task run; should not propagate.
-    for _ in range(5):
-        await asyncio.sleep(0)
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    monkeypatch.setattr(mod, "extract_shutter_states", lambda _p: {"u1": b"changed"})
+    ok = await coord._wait_for_shutter_change("u1", baseline_slice=b"baseline")
+    assert ok is True
+    assert call["n"] >= 2  # the first failed, then a second succeeded
 
 
 # ---- async_set_position / async_open / async_close_shutter wiring ----------
@@ -424,7 +487,7 @@ async def test_high_level_commands_pass_through(coord):
         async def set_open_percent(self, plant_id, uuid, percent):
             calls.append(("set", plant_id, uuid, percent))
 
-    async def fake_send(do_call):
+    async def fake_send(shutter_uuid, do_call):
         await do_call(FakeClient())
 
     coord._send_command = fake_send  # type: ignore[assignment]

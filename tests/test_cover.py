@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from homeassistant.components.cover import ATTR_POSITION
+from homeassistant.exceptions import HomeAssistantError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.finder_you.api import Shutter
+from custom_components.finder_you.api import GatewayOfflineError, Shutter
 from custom_components.finder_you.const import (
     CONF_EMAIL,
     CONF_PASSWORD,
@@ -101,25 +103,12 @@ async def test_added_to_hass_ignores_non_numeric_position(hass):
 # ---- current_cover_position + is_closed ---------------------------------
 
 
-def test_position_uses_observed_outside_command_window():
-    """When no command was issued recently, observed wins so external
-    state (wall switch, app) propagates into HA."""
+def test_position_uses_observed_when_present():
+    """The coordinator's send waits for verification, so by the time we
+    report a position the observed value is the source of truth."""
     coord = _make_coord(data={"uuid-1": 33})
     e = FinderYouCover(coord, Shutter("uuid-1", "S"))
-    # _last_command_at defaults to 0 → way outside the window.
     assert e.current_cover_position == 33
-
-
-def test_position_prefers_commanded_inside_command_window():
-    """Right after a command, observed is stale (gateway cache lags), so
-    we report the commanded target instead."""
-    coord = _make_coord(data={"uuid-1": 100})
-    e = FinderYouCover(coord, Shutter("uuid-1", "S"))
-    import time
-
-    e._last_commanded_position = 0
-    e._last_command_at = time.time()  # just now
-    assert e.current_cover_position == 0
 
 
 def test_position_falls_back_to_last_commanded_when_no_data():
@@ -186,12 +175,21 @@ async def test_set_cover_position_updates_state(hass):
     e.hass = hass
     e.entity_id = "cover.test"
     e.async_write_ha_state = MagicMock()
-    import time
-
-    before = time.time()
     await e.async_set_cover_position(**{ATTR_POSITION: 55})
     coord.async_set_position.assert_called_once_with("uuid-1", 55)
     assert e._last_commanded_position == 55
-    # Timestamp is captured so the position property knows we're inside the
-    # recent-command window and should report the commanded target.
-    assert e._last_command_at >= before
+
+
+async def test_gateway_offline_translates_to_home_assistant_error(hass):
+    """If the coordinator raises GatewayOfflineError (verify timed out),
+    the cover surfaces it to HA so HomeKit shows the failure."""
+    coord = _make_coord()
+    coord.async_open = AsyncMock(side_effect=GatewayOfflineError("dead"))
+    e = FinderYouCover(coord, Shutter("uuid-1", "Salotto"))
+    e.hass = hass
+    e.async_write_ha_state = MagicMock()
+    with pytest.raises(HomeAssistantError, match="didn't acknowledge"):
+        await e.async_open_cover()
+    # On failure we don't update the cached commanded position.
+    assert e._last_commanded_position == 100
+    e.async_write_ha_state.assert_not_called()

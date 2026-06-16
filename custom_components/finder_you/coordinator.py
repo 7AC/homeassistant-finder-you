@@ -16,9 +16,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import (
     FinderApiError,
     FinderHomeClient,
+    GatewayOfflineError,
     OAuthError,
     Shutter,
     extract_shutter_positions,
+    extract_shutter_states,
     fetch_token,
     parse_plant,
     refresh_token,
@@ -31,11 +33,13 @@ from .const import DEFAULT_SCAN_INTERVAL_SECONDS, DOMAIN
 # gateway processes each command cleanly. The gap is small enough that
 # single user-initiated taps feel instant.
 COMMAND_SEND_GAP = 0.25
-# How long after a command to trigger a refresh of the plant, so the real
-# position propagates into HA quickly instead of waiting for the next
-# scheduled scan. Empirically the gateway's plant-cache lags a few seconds
-# behind a successful command.
-POST_COMMAND_REFRESH_DELAY = 4.0
+# How long after a command to wait for the gateway's plant-state cache to
+# reflect the change. Empirically the cache can lag 30-60 s behind the
+# physical action, so we give it that much time before declaring failure.
+VERIFY_TIMEOUT = 60.0
+# How often to re-fetch the plant during verification. Cheap call; tight
+# polling makes successful commands feel as fast as possible.
+VERIFY_POLL_INTERVAL = 2.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -170,66 +174,80 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         positions = extract_shutter_positions(plant_payload)
         return {s.uuid: positions.get(s.uuid) for s in self._shutters}
 
-    async def _send_command(self, do_call) -> None:
-        """Send a single command, serialized + spaced behind ``_send_lock``.
+    async def _send_command(self, shutter_uuid: str, do_call) -> None:
+        """Send a command, then verify by watching the plant state.
 
         The YESLY gateway's WiFi/MQTT link silently drops commands when
         more than one or two arrive within ~100 ms. A Home/Siri scene that
-        closes six shutters triggers exactly that burst. We hold a lock
-        across the send and require at least ``COMMAND_SEND_GAP`` seconds
-        between consecutive sends — empirically that's the difference
-        between the gateway acting on every command and silently
-        swallowing half of them.
+        closes six shutters triggers exactly that burst, and the gateway
+        also intermittently drops single commands when its link is
+        congested. To handle both:
 
-        We don't try to verify the command landed by polling the plant:
-        the gateway's plant-state cache lags 30+ seconds behind a
-        successful command, so verifying inside any reasonable HomeKit
-        timeout produces false negatives. Instead we trust the
-        cloud-level send (with serialization) and kick a delayed refresh
-        so the real position propagates as soon as the cache catches up.
+          * Serialize all sends through ``_send_lock`` with a small gap
+            between consecutive calls so the gateway never sees a burst.
+          * After the cloud accepts the send, capture a baseline of the
+            target shutter's per-shutter state slice and poll the plant
+            until that slice changes (proof the gateway recorded the
+            action) or until ``VERIFY_TIMEOUT`` elapses.
+
+        On verify timeout we raise ``GatewayOfflineError`` so the cover
+        translates it into a HomeAssistantError; HomeKit then reverts to
+        the actual observed state instead of falsely claiming success.
         """
         async with self._send_lock:
             loop = asyncio.get_event_loop()
             wait = COMMAND_SEND_GAP - (loop.time() - self._last_send_ts)
             if wait > 0:
                 await asyncio.sleep(wait)
+            baseline_payload = await self._run_or_reconnect(lambda c: c.get_plant(self._plant_id))
             await self._run_or_reconnect(do_call)
             self._last_send_ts = asyncio.get_event_loop().time()
-        self._schedule_post_command_refresh()
 
-    def _schedule_post_command_refresh(self) -> None:
-        """Trigger an async coordinator refresh after a short delay.
+        baseline_slice = extract_shutter_states(baseline_payload).get(shutter_uuid)
+        if not await self._wait_for_shutter_change(shutter_uuid, baseline_slice):
+            raise GatewayOfflineError(
+                f"gateway didn't reflect {shutter_uuid} within "
+                f"{VERIFY_TIMEOUT:.0f}s — likely offline or congested"
+            )
+        # Verify succeeded: kick a coordinator refresh so HA's state
+        # picks up the new position the next time HomeKit reads it.
+        await self.async_request_refresh()
 
-        The gateway's plant cache lags the actual command. A single
-        refresh ~4 s after the send is usually enough for the new
-        position to land in HA, instead of waiting up to a full scan
-        interval for the periodic poll.
-        """
-
-        async def delayed() -> None:
+    async def _wait_for_shutter_change(
+        self, shutter_uuid: str, baseline_slice: bytes | None
+    ) -> bool:
+        """Poll the plant until this shutter's state slice differs from baseline."""
+        deadline = asyncio.get_event_loop().time() + VERIFY_TIMEOUT
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(VERIFY_POLL_INTERVAL)
             try:
-                await asyncio.sleep(POST_COMMAND_REFRESH_DELAY)
-                await self.async_request_refresh()
+                payload = await self._run_or_reconnect(lambda c: c.get_plant(self._plant_id))
             except Exception:
-                _LOGGER.debug("post-command refresh failed", exc_info=True)
-
-        self.hass.async_create_task(delayed())
+                _LOGGER.debug("verify poll failed", exc_info=True)
+                continue
+            current = extract_shutter_states(payload).get(shutter_uuid)
+            if current is not None and current != baseline_slice:
+                return True
+        return False
 
     async def async_set_position(self, shutter_uuid: str, percent: int) -> None:
         assert self._plant_id is not None
         await self._send_command(
+            shutter_uuid,
             lambda c: c.set_open_percent(self._plant_id, shutter_uuid.encode(), percent),
         )
 
     async def async_open(self, shutter_uuid: str) -> None:
         assert self._plant_id is not None
         await self._send_command(
+            shutter_uuid,
             lambda c: c.open_full(self._plant_id, shutter_uuid.encode()),
         )
 
     async def async_close_shutter(self, shutter_uuid: str) -> None:
         assert self._plant_id is not None
         await self._send_command(
+            shutter_uuid,
             lambda c: c.close_full(self._plant_id, shutter_uuid.encode()),
         )
 
