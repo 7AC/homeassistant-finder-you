@@ -223,6 +223,18 @@ timeout) before reporting success to HA. Trusting the cloud-level ack
 alone leads to false positives: the cloud accepts commands the gateway
 silently drops.
 
+**Caveat — stale subscriptions.** Even with the keepalive (re-sending
+the subscribe-client message every 30 s — see §4), the
+`OpenNotificationChannel` claim can go silently stale on the cloud
+side after a server restart or claim expiry, and every subsequent
+`SetOpenPercent` is dropped on the floor even though `GetPlant` still
+works. The gateway only recovers when we tear down the HTTP/2
+connection and re-run the full 3-message handshake. The integration
+self-heals: on a verify timeout it drops the client and retries the
+command once before raising `GatewayOfflineError`, so this failure
+mode is invisible to the user unless the gateway is genuinely wedged
+(BLE-mesh side dead, not just the cloud subscription).
+
 ---
 
 ## 4. OpenNotificationChannel — the 3-message subscription

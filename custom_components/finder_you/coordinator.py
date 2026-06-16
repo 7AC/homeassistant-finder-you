@@ -177,22 +177,40 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
     async def _send_command(self, shutter_uuid: str, do_call) -> None:
         """Send a command, then verify by watching the plant state.
 
+        On verify timeout, the gateway's WiFi link is fine but its cloud
+        subscription has gone stale (server restart, claim expired). The
+        fix is a fresh 3-message OpenNotificationChannel handshake, which
+        ``_drop_client`` triggers on the next call. We retry the command
+        exactly once after dropping the client; if the retry also fails,
+        the gateway is truly wedged and we raise.
+        """
+        try:
+            await self._send_and_verify(shutter_uuid, do_call)
+        except GatewayOfflineError:
+            _LOGGER.info(
+                "gateway didn't reflect %s; dropping client and retrying once",
+                shutter_uuid,
+            )
+            await self._drop_client()
+            await self._send_and_verify(shutter_uuid, do_call)
+
+    async def _send_and_verify(self, shutter_uuid: str, do_call) -> None:
+        """One send-then-verify cycle.
+
         The YESLY gateway's WiFi/MQTT link silently drops commands when
         more than one or two arrive within ~100 ms. A Home/Siri scene that
-        closes six shutters triggers exactly that burst, and the gateway
-        also intermittently drops single commands when its link is
-        congested. To handle both:
+        closes six shutters triggers exactly that burst. To handle both
+        bursts and single-command congestion:
 
-          * Serialize all sends through ``_send_lock`` with a small gap
+          * Serialize sends through ``_send_lock`` with a small gap
             between consecutive calls so the gateway never sees a burst.
           * After the cloud accepts the send, capture a baseline of the
             target shutter's per-shutter state slice and poll the plant
             until that slice changes (proof the gateway recorded the
             action) or until ``VERIFY_TIMEOUT`` elapses.
 
-        On verify timeout we raise ``GatewayOfflineError`` so the cover
-        translates it into a HomeAssistantError; HomeKit then reverts to
-        the actual observed state instead of falsely claiming success.
+        On verify timeout we raise ``GatewayOfflineError`` so the caller
+        can drop the client and retry, or surface the failure to HA.
         """
         async with self._send_lock:
             loop = asyncio.get_event_loop()

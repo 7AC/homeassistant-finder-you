@@ -402,26 +402,64 @@ async def test_send_command_serializes_concurrent_callers(coord, monkeypatch):
 
 
 async def test_send_command_raises_when_gateway_doesnt_act(coord, monkeypatch):
-    """If the plant slice never changes within VERIFY_TIMEOUT, the
-    coordinator must raise GatewayOfflineError so the cover translates
-    it into a HomeAssistantError and HomeKit reverts."""
+    """If both the first send-and-verify *and* the post-reconnect retry
+    time out, the coordinator surfaces GatewayOfflineError so the cover
+    translates it into a HomeAssistantError and HomeKit reverts."""
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
     monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
     monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.01)
-    # Baseline A, every poll returns A → never changes.
-    monkeypatch.setattr(mod, "extract_shutter_states", _verify_stub([], [b"A"] * 100))
+    # Baseline A, every poll returns A → never changes, for both attempts.
+    monkeypatch.setattr(mod, "extract_shutter_states", _verify_stub([], [b"A"] * 1000))
 
     async def runner(fn):
         return await fn(AsyncMock())
 
     coord._run_or_reconnect = runner  # type: ignore[assignment]
     coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
 
     async def noop(c):
         return None
 
     with pytest.raises(GatewayOfflineError):
         await coord._send_command("u1", noop)
+    # The first failure must have forced a client drop before the retry.
+    coord._drop_client.assert_awaited_once()
+
+
+async def test_send_command_self_heals_on_first_failure(coord, monkeypatch):
+    """On the first verify timeout the coordinator must drop the client
+    (forcing a fresh OpenNotificationChannel handshake) and retry the
+    command once. If the retry succeeds, no error reaches HA."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.01)
+
+    state = {"calls": 0}
+
+    def fake_extract(_payload):
+        # 1st send_and_verify: baseline A then always A → timeout.
+        # 2nd send_and_verify (after drop_client): baseline A then B → success.
+        state["calls"] += 1
+        if state["calls"] < 30:
+            return {"u1": b"A"}
+        return {"u1": b"B"}
+
+    monkeypatch.setattr(mod, "extract_shutter_states", fake_extract)
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", noop)
+    # Self-heal: drop_client fired exactly once between the two attempts.
+    coord._drop_client.assert_awaited_once()
 
 
 async def test_send_command_succeeds_when_slice_changes(coord, monkeypatch):
