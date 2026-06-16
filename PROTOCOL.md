@@ -184,17 +184,44 @@ Server accepts both Android and iOS-style platform/device strings.
 
 ### The `GetPlant` response
 
-~27 KB of protobuf containing the full plant tree:
+~22 KB of protobuf containing the full plant tree:
 
 - Devices at the top with their UUIDs and AES-128 keys (used for local
   BLE-mesh signing if you ever go off-cloud).
 - Rooms tree with display names and device-type markers
   `device_roller_shutter_50` (shutters), `device_light_bulb` (lights).
 - Scenes/scenarios with their UUIDs and human-readable names.
+- One per-device **state submessage** per shutter, repeated under
+  field 12 of the plant body (top-level field 3 of the response
+  wrapper). The state submessage carries:
+
+| Field | Meaning |
+|-------|---------|
+| `#1`  | shutter UUID (36-char string) |
+| `#2`  | plant UUID (same for every shutter) |
+| `#3`  | device-family string (`13S2` for these shutters) |
+| `#4`  | BLE MAC address (in `{ #1: "AA:BB:CC:DD:EE:FF" }`) |
+| `#6`  | config JSON blob (channel mappings, names) |
+| `#7`  | commissioning timestamps (`#1`, `#2` varints) |
+| `#8`  | gateway UUID |
+| `#9`  | RSSI / signal value |
+| `#11` | reserved varint |
+| `#12` | motion flag (`varint(2)` = idle, `varint(3)` = moving) |
+| `#13` | open percentage (`{ #1: varint(0..100) }`) |
 
 The integration walks this tree to enumerate shutters as
-`{uuid, name, room_name}`. See
+`{uuid, name, room_name}` and to extract per-shutter positions for
+HomeKit state. See
 [`api/plant.py`](custom_components/finder_you/api/plant.py).
+
+**Caveat — plant-cache lag.** The position fields update *lazily*: a
+successful `SetOpenPercent` is reflected in the plant payload anywhere
+from a few seconds to a minute later, depending on the gateway's
+WiFi/MQTT link health. After issuing a command we poll `GetPlant`
+until the target shutter's state slice changes (or up to a 60-second
+timeout) before reporting success to HA. Trusting the cloud-level ack
+alone leads to false positives: the cloud accepts commands the gateway
+silently drops.
 
 ---
 

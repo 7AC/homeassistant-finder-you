@@ -132,15 +132,23 @@ def extract_shutter_positions(payload: bytes) -> dict[str, int]:
 def _iter_state_submessages(payload: bytes):
     """Yield ``(submessage_bytes, parsed_fields_dict)`` for each shutter.
 
-    We scan only the depth-1 submessages attached at field 12 of the plant
-    wrapper, filtered by the stable field-id schema (avoids accidentally
-    matching unrelated messages that happen to share a few fields).
+    The per-shutter state messages live inside the plant body (top-level
+    field 3), attached as repeated entries on field 12 of that body. We
+    filter by the stable field-id schema (avoids matching unrelated
+    messages that happen to share a few fields).
     """
     try:
         top = parse_fields(payload)
     except Exception:
         return
-    for sub in top.get(12, []):
+    plant_body = top.get(3, [None])[0]
+    if not isinstance(plant_body, bytes):
+        return
+    try:
+        plant_fields = parse_fields(plant_body)
+    except Exception:
+        return
+    for sub in plant_fields.get(12, []):
         if not isinstance(sub, bytes):
             continue
         try:

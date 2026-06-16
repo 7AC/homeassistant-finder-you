@@ -211,7 +211,13 @@ def _make_state(uuid: str, *, position: int = 100, motion: int = 2) -> bytes:
 
 
 def _wrap_states(states: list[bytes]) -> bytes:
-    return b"".join(field_string(12, s) for s in states)
+    """Wrap state submessages into a plant payload.
+
+    Per-shutter state lives at field 12 of the plant *body*, which itself
+    is the top-level field 3 of the response wrapper.
+    """
+    body = b"".join(field_string(12, s) for s in states)
+    return field_string(3, body)
 
 
 def test_extract_shutter_states_returns_uuid_to_slice_map():
@@ -243,14 +249,35 @@ def test_extract_shutter_states_changes_between_baselines():
 
 
 def test_extract_shutter_states_skips_messages_with_wrong_field_set():
-    # A submessage at field 12 that doesn't have the full schema is ignored.
-    payload = field_string(12, field_string(1, b"u" * 36))
+    # A submessage at field 12 of the plant body that doesn't have the
+    # full schema is ignored.
+    payload = field_string(3, field_string(12, field_string(1, b"u" * 36)))
     assert extract_shutter_states(payload) == {}
 
 
 def test_extract_shutter_states_skips_non_bytes_field_12():
     # Field 12 as a varint (wrong wire type) is silently skipped.
-    payload = field_varint(12, 42)
+    payload = field_string(3, field_varint(12, 42))
+    assert extract_shutter_states(payload) == {}
+
+
+def test_extract_shutter_states_skips_missing_plant_body():
+    # No field 3 at all → nothing to iterate.
+    payload = field_string(1, b"unrelated")
+    assert extract_shutter_states(payload) == {}
+
+
+def test_extract_shutter_states_skips_non_bytes_plant_body():
+    # Field 3 as a varint is the wrong wire type — silently skipped.
+    payload = field_varint(3, 1)
+    assert extract_shutter_states(payload) == {}
+
+
+def test_extract_shutter_states_skips_malformed_plant_body():
+    # Field 3 carries bytes that parse_fields can't decode (unsupported
+    # wire type) — the iterator must swallow the error.
+    bad_body = bytes([(1 << 3) | 3])
+    payload = field_string(3, bad_body)
     assert extract_shutter_states(payload) == {}
 
 
@@ -387,7 +414,8 @@ def test_extract_shutter_positions_swallows_parse_exception_inside_pos_msg():
 
 
 def test_iter_state_submessages_swallows_parse_exception_in_field_12_body():
-    # Field 12 carrying a body that parse_fields can't decode (wire type 3).
+    # Field 12 (inside the plant body) carrying bytes that parse_fields
+    # can't decode (wire type 3) must be silently skipped.
     bad_sub = bytes([(1 << 3) | 3])
-    payload = field_string(12, bad_sub)
+    payload = field_string(3, field_string(12, bad_sub))
     assert extract_shutter_states(payload) == {}
