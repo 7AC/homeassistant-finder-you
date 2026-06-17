@@ -129,6 +129,28 @@ def extract_shutter_positions(payload: bytes) -> dict[str, int]:
     return out
 
 
+def extract_shutter_motion(payload: bytes) -> dict[str, int]:
+    """Return ``{shutter_uuid: motion_flag}`` from a GetPlant response.
+
+    The motion flag (state submessage field #12) reads 2 when the shutter
+    is idle and 3 while the gateway is actively driving the motor over
+    BLE-mesh. Observing 3 even briefly during a verify window is proof
+    that the BLE-mesh hop reached the shutter — useful when the position
+    field is empty (the gateway hasn't yet received a fresh telemetry
+    reading from the shutter) and ``extract_shutter_positions`` can't
+    tell us whether the motor ran.
+    """
+    out: dict[str, int] = {}
+    for _sub, fields in _iter_state_submessages(payload):
+        uuid_b = fields.get(1, [None])[0]
+        if not isinstance(uuid_b, bytes) or len(uuid_b) != 36:
+            continue
+        motion = fields.get(12, [None])[0]
+        if isinstance(motion, int):
+            out[uuid_b.decode()] = motion
+    return out
+
+
 def _iter_state_submessages(payload: bytes):
     """Yield ``(submessage_bytes, parsed_fields_dict)`` for each shutter.
 

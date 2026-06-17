@@ -311,21 +311,20 @@ async def test_update_data_other_known_errors_raise_update_failed(coord, monkeyp
 # ---- _send_command: serialization + verify-by-plant-diff -----------------
 
 
-def _verify_stub(extract_calls, slice_sequence):
-    """Build an extract_shutter_states replacement driven by a sequence.
+def _position_stub(position_sequence):
+    """Build an extract_shutter_positions replacement driven by a sequence.
 
-    Each call returns ``{"u1": slice_sequence[i]}`` (or ``{}`` if None),
-    so the test can script exactly what each verify poll observes.
+    Each call returns ``{"u1": position_sequence[i]}``, so the test can
+    script exactly what each verify poll observes.
     """
-    iterator = iter(slice_sequence)
+    iterator = iter(position_sequence)
 
     def fake_extract(_payload):
         try:
-            sl = next(iterator)
+            p = next(iterator)
         except StopIteration:
-            return {}
-        extract_calls.append(sl)
-        return {"u1": sl} if sl is not None else {}
+            return {"u1": None}
+        return {"u1": p}
 
     return fake_extract
 
@@ -339,7 +338,7 @@ async def test_send_command_waits_between_consecutive_sends(coord, monkeypatch):
     async def fake_wait(*_args, **_kw):
         return True
 
-    coord._wait_for_shutter_change = fake_wait  # type: ignore[assignment]
+    coord._wait_for_motor_evidence = fake_wait  # type: ignore[assignment]
 
     send_timestamps: list[float] = []
     loop = asyncio.get_event_loop()
@@ -359,8 +358,8 @@ async def test_send_command_waits_between_consecutive_sends(coord, monkeypatch):
     async def noop(c):
         return None
 
-    await coord._send_command("u1", noop)
-    await coord._send_command("u1", noop)
+    await coord._send_command("u1", 0, noop)
+    await coord._send_command("u1", 0, noop)
     assert len(send_timestamps) == 2
     assert send_timestamps[1] - send_timestamps[0] >= 0.05 - 0.005
 
@@ -370,12 +369,9 @@ async def test_send_command_serializes_concurrent_callers(coord, monkeypatch):
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
     monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
     monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.05)
-    # Every send sees a successful verify (baseline A, current B).
-    monkeypatch.setattr(
-        mod,
-        "extract_shutter_states",
-        _verify_stub([], [b"A", b"B"] * 10),
-    )
+    # Every send sees a successful verify: baseline 100, first poll 50.
+    monkeypatch.setattr(mod, "extract_shutter_positions", _position_stub([100, 50] * 10))
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
     coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
 
     in_flight = 0
@@ -394,7 +390,7 @@ async def test_send_command_serializes_concurrent_callers(coord, monkeypatch):
     async def noop(c):
         return None
 
-    await asyncio.gather(*(coord._send_command("u1", noop) for _ in range(4)))
+    await asyncio.gather(*(coord._send_command("u1", 0, noop) for _ in range(4)))
     # The lock only guards baseline-get + send, not the verify polls, so
     # the cap measures send-path concurrency. Verify polls fire outside
     # the lock and can run in parallel with subsequent sends.
@@ -408,8 +404,10 @@ async def test_send_command_raises_when_gateway_doesnt_act(coord, monkeypatch):
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
     monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
     monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.01)
-    # Baseline A, every poll returns A → never changes, for both attempts.
-    monkeypatch.setattr(mod, "extract_shutter_states", _verify_stub([], [b"A"] * 1000))
+    # Baseline 100, every poll returns 100 → position never moves.
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": 100})
+    # Motion stays idle (2) — gateway never engaged the motor.
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
 
     async def runner(fn):
         return await fn(AsyncMock())
@@ -422,32 +420,33 @@ async def test_send_command_raises_when_gateway_doesnt_act(coord, monkeypatch):
         return None
 
     with pytest.raises(GatewayOfflineError):
-        await coord._send_command("u1", noop)
-    # The first failure must have forced a client drop before the retry.
-    coord._drop_client.assert_awaited_once()
+        await coord._send_command("u1", 0, noop)
+    # MAX_SEND_ATTEMPTS=3, so two drops between three attempts.
+    assert coord._drop_client.await_count == mod.MAX_SEND_ATTEMPTS - 1
 
 
 async def test_send_command_self_heals_on_first_failure(coord, monkeypatch):
     """On the first verify timeout the coordinator must drop the client
     (forcing a fresh OpenNotificationChannel handshake) and retry the
-    command once. If the retry succeeds, no error reaches HA."""
+    command. If a retry succeeds, no error reaches HA."""
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
     monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
     monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.01)
 
-    # Track state across the two cycles. In cycle 1 every extract returns A,
-    # so verify times out. drop_client flips the flag; in cycle 2 the very
-    # first extract (baseline) still returns A, and from the second extract
-    # onward (the verify polls) it returns B — so the slice differs.
+    # Cycle 1: baseline 100, polls 100 → no movement → timeout.
+    # drop_client flips the flag.
+    # Cycle 2: baseline 100 (first call), then 50 (motor moved).
     state = {"dropped": False, "post_drop_calls": 0}
 
     def fake_extract(_payload):
         if not state["dropped"]:
-            return {"u1": b"A"}
+            return {"u1": 100}
         state["post_drop_calls"] += 1
-        return {"u1": b"A"} if state["post_drop_calls"] == 1 else {"u1": b"B"}
+        return {"u1": 100} if state["post_drop_calls"] == 1 else {"u1": 50}
 
-    monkeypatch.setattr(mod, "extract_shutter_states", fake_extract)
+    monkeypatch.setattr(mod, "extract_shutter_positions", fake_extract)
+    # Motion stays idle throughout — only position-change drives this test.
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
 
     async def runner(fn):
         return await fn(AsyncMock())
@@ -463,17 +462,18 @@ async def test_send_command_self_heals_on_first_failure(coord, monkeypatch):
     async def noop(c):
         return None
 
-    await coord._send_command("u1", noop)
+    await coord._send_command("u1", 0, noop)
     # Self-heal: drop_client fired exactly once between the two attempts.
     coord._drop_client.assert_awaited_once()
 
 
-async def test_send_command_succeeds_when_slice_changes(coord, monkeypatch):
+async def test_send_command_succeeds_when_position_changes(coord, monkeypatch):
     """A normal successful command: baseline differs from a subsequent poll."""
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
     monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
     monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.1)
-    monkeypatch.setattr(mod, "extract_shutter_states", _verify_stub([], [b"A", b"B"]))
+    monkeypatch.setattr(mod, "extract_shutter_positions", _position_stub([100, 50]))
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
 
     async def runner(fn):
         return await fn(AsyncMock())
@@ -489,12 +489,73 @@ async def test_send_command_succeeds_when_slice_changes(coord, monkeypatch):
     async def noop(c):
         return None
 
-    await coord._send_command("u1", noop)
+    await coord._send_command("u1", 0, noop)
     # On success the coordinator kicks an HA refresh.
     assert refresh_calls
 
 
-async def test_wait_for_shutter_change_skips_failed_polls(coord, monkeypatch):
+async def test_send_command_succeeds_on_motion_signal(coord, monkeypatch):
+    """When position can't be used (e.g. baseline already None) the motion
+    flag transitioning to 3 must count as motor evidence."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.1)
+    # Baseline None, every poll returns None → no position change ever.
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": None})
+    # First two polls report idle, then the gateway flips to driving.
+    motion_seq = iter([2, 2, 3, 3])
+
+    def fake_motion(_payload):
+        try:
+            return {"u1": next(motion_seq)}
+        except StopIteration:
+            return {"u1": 3}
+
+    monkeypatch.setattr(mod, "extract_shutter_motion", fake_motion)
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", 0, noop)
+    coord._drop_client.assert_not_awaited()
+
+
+async def test_send_command_skips_verify_when_already_at_target(coord, monkeypatch):
+    """If the shutter's current position already matches the target the
+    coordinator must short-circuit: no verify wait, no GatewayOfflineError
+    even though position will never change."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    # Set timeout small enough that a real verify would fail this test.
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.01)
+    # Baseline reports 100 (open) and never changes; without the short-
+    # circuit this would raise.
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": 100})
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    # Target 100 = baseline 100 → must succeed without waiting.
+    await coord._send_command("u1", 100, noop)
+    coord._drop_client.assert_not_awaited()
+
+
+async def test_wait_for_motor_evidence_skips_failed_polls(coord, monkeypatch):
     """A transient error during a verify poll must be logged but not abort
     the loop; subsequent polls keep trying."""
     monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
@@ -508,8 +569,9 @@ async def test_wait_for_shutter_change_skips_failed_polls(coord, monkeypatch):
         return b"plant"
 
     coord._run_or_reconnect = runner  # type: ignore[assignment]
-    monkeypatch.setattr(mod, "extract_shutter_states", lambda _p: {"u1": b"changed"})
-    ok = await coord._wait_for_shutter_change("u1", baseline_slice=b"baseline")
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": 50})
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+    ok = await coord._wait_for_motor_evidence("u1", baseline_position=100)
     assert ok is True
     assert call["n"] >= 2  # the first failed, then a second succeeded
 
@@ -531,7 +593,10 @@ async def test_high_level_commands_pass_through(coord):
         async def set_open_percent(self, plant_id, uuid, percent):
             calls.append(("set", plant_id, uuid, percent))
 
-    async def fake_send(shutter_uuid, do_call):
+    targets = []
+
+    async def fake_send(shutter_uuid, target, do_call):
+        targets.append((shutter_uuid, target))
         await do_call(FakeClient())
 
     coord._send_command = fake_send  # type: ignore[assignment]
@@ -543,6 +608,8 @@ async def test_high_level_commands_pass_through(coord):
         ("close", b"PID", b"u2"),
         ("set", b"PID", b"u3", 33),
     ]
+    # Targets must reflect the semantic position: open=100, close=0, set=N.
+    assert targets == [("u1", 100), ("u2", 0), ("u3", 33)]
 
 
 # ---- async_shutdown -------------------------------------------------------

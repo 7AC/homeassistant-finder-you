@@ -19,8 +19,8 @@ from .api import (
     GatewayOfflineError,
     OAuthError,
     Shutter,
+    extract_shutter_motion,
     extract_shutter_positions,
-    extract_shutter_states,
     fetch_token,
     parse_plant,
     refresh_token,
@@ -40,6 +40,14 @@ COMMAND_SEND_GAP = 2.0
 # we've observed; the alternative (declaring failure when the shutter
 # actually moved) is worse than making the user wait.
 VERIFY_TIMEOUT = 180.0
+# How many times to retry a command if verify fails. Each retry tears
+# down the cloud client and re-runs the OpenNotificationChannel handshake,
+# which resolves any cloud-side subscription staleness. Three attempts
+# total gives the gateway multiple shots at landing the BLE-mesh hop —
+# the dominant remaining failure for the shutter that's farthest from
+# the puck. Total worst-case time per shutter: 3 × VERIFY_TIMEOUT plus
+# a few seconds of reconnect overhead.
+MAX_SEND_ATTEMPTS = 3
 # How often to re-fetch the plant during verification. Cheap call; tight
 # polling makes successful commands feel as fast as possible.
 VERIFY_POLL_INTERVAL = 2.0
@@ -177,43 +185,71 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         positions = extract_shutter_positions(plant_payload)
         return {s.uuid: positions.get(s.uuid) for s in self._shutters}
 
-    async def _send_command(self, shutter_uuid: str, do_call) -> None:
-        """Send a command, then verify by watching the plant state.
+    async def _send_command(self, shutter_uuid: str, target: int, do_call) -> None:
+        """Send a command, retrying with fresh handshake on verify failure.
 
-        On verify timeout, the gateway's WiFi link is fine but its cloud
-        subscription has gone stale (server restart, claim expired). The
-        fix is a fresh 3-message OpenNotificationChannel handshake, which
-        ``_drop_client`` triggers on the next call. We retry the command
-        exactly once after dropping the client; if the retry also fails,
-        the gateway is truly wedged and we raise.
+        Each verify timeout means one of:
+          * The gateway's cloud-side subscription has gone stale (server
+            restart, claim expiry) and is dropping our RPC silently.
+            ``_drop_client`` fixes this on the next call.
+          * The gateway's BLE-mesh hop to this specific shutter dropped
+            on the floor (congestion, transient link). A fresh re-send
+            gets a new shot.
+
+        Both paths benefit from "drop, reconnect, send again". We try up
+        to ``MAX_SEND_ATTEMPTS`` times; if all of them fail to elicit
+        motor evidence the gateway is truly wedged for this shutter and
+        we raise so HA can surface the failure.
         """
-        try:
-            await self._send_and_verify(shutter_uuid, do_call)
-        except GatewayOfflineError:
-            _LOGGER.info(
-                "gateway didn't reflect %s; dropping client and retrying once",
-                shutter_uuid,
-            )
-            await self._drop_client()
-            await self._send_and_verify(shutter_uuid, do_call)
+        for attempt in range(MAX_SEND_ATTEMPTS):
+            try:
+                await self._send_and_verify(shutter_uuid, target, do_call)
+                return
+            except GatewayOfflineError:
+                if attempt == MAX_SEND_ATTEMPTS - 1:
+                    raise
+                _LOGGER.info(
+                    "gateway didn't reflect %s on attempt %d/%d; "
+                    "dropping client and retrying",
+                    shutter_uuid,
+                    attempt + 1,
+                    MAX_SEND_ATTEMPTS,
+                )
+                await self._drop_client()
 
-    async def _send_and_verify(self, shutter_uuid: str, do_call) -> None:
+    async def _send_and_verify(self, shutter_uuid: str, target: int, do_call) -> None:
         """One send-then-verify cycle.
 
         The YESLY gateway's WiFi/MQTT link silently drops commands when
-        more than one or two arrive within ~100 ms. A Home/Siri scene that
-        closes six shutters triggers exactly that burst. To handle both
-        bursts and single-command congestion:
+        more than one or two arrive within ~100 ms, and its BLE-mesh
+        fan-out to the actual shutters drops the farthest hops when six
+        shutters fire concurrently. Defense:
 
-          * Serialize sends through ``_send_lock`` with a small gap
-            between consecutive calls so the gateway never sees a burst.
-          * After the cloud accepts the send, capture a baseline of the
-            target shutter's per-shutter state slice and poll the plant
-            until that slice changes (proof the gateway recorded the
-            action) or until ``VERIFY_TIMEOUT`` elapses.
+          * Serialize sends through ``_send_lock`` with ``COMMAND_SEND_GAP``
+            between consecutive calls so neither the WiFi link nor the
+            BLE-mesh sees a burst.
+          * After the cloud accepts the send, capture the shutter's
+            current position and motion flag and poll the plant until we
+            see *evidence the motor actually ran* (see
+            ``_wait_for_motor_evidence``) or ``VERIFY_TIMEOUT`` elapses.
+
+        Why two signals (position + motion) instead of just position:
+        the position field changes when the shutter reports its new
+        physical reading back to the gateway via BLE-mesh telemetry —
+        usually within seconds, but the cache lag can stretch past 90 s
+        during scene bursts, and on a shutter whose pre-send position
+        was already empty (Camera Alex in our setup) we have no baseline
+        to detect a change against. The motion flag (#12) reads 3 while
+        the gateway is actively driving the motor, so observing it even
+        briefly is positive proof that the BLE-mesh hop reached the
+        shutter — independent of whether telemetry has come back yet.
+
+        Short-circuit: if the shutter's position already matches
+        ``target`` we don't expect any motor movement, so we send the
+        command for safety but skip the verify wait.
 
         On verify timeout we raise ``GatewayOfflineError`` so the caller
-        can drop the client and retry, or surface the failure to HA.
+        can drop+retry or surface the failure to HA.
         """
         async with self._send_lock:
             loop = asyncio.get_event_loop()
@@ -224,8 +260,12 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
             await self._run_or_reconnect(do_call)
             self._last_send_ts = asyncio.get_event_loop().time()
 
-        baseline_slice = extract_shutter_states(baseline_payload).get(shutter_uuid)
-        if not await self._wait_for_shutter_change(shutter_uuid, baseline_slice):
+        baseline_position = extract_shutter_positions(baseline_payload).get(shutter_uuid)
+        if baseline_position == target:
+            # Already at target — no motor movement to detect.
+            await self.async_request_refresh()
+            return
+        if not await self._wait_for_motor_evidence(shutter_uuid, baseline_position):
             raise GatewayOfflineError(
                 f"gateway didn't reflect {shutter_uuid} within "
                 f"{VERIFY_TIMEOUT:.0f}s — likely offline or congested"
@@ -234,10 +274,21 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         # picks up the new position the next time HomeKit reads it.
         await self.async_request_refresh()
 
-    async def _wait_for_shutter_change(
-        self, shutter_uuid: str, baseline_slice: bytes | None
+    async def _wait_for_motor_evidence(
+        self, shutter_uuid: str, baseline_position: int | None
     ) -> bool:
-        """Poll the plant until this shutter's state slice differs from baseline."""
+        """Poll the plant for proof the shutter motor actually ran.
+
+        Either signal counts as evidence:
+          * Position field changes from ``baseline_position`` — the
+            shutter has reported a new physical reading back to the
+            gateway. Most reliable, but needs a known baseline and is
+            subject to telemetry cache lag.
+          * Motion flag (#12) observed at 3 ("moving") — the gateway is
+            actively driving the motor over BLE-mesh. Faster than
+            position telemetry and doesn't need a baseline; the only way
+            we'd observe 3 is if the BLE-mesh hop reached the shutter.
+        """
         deadline = asyncio.get_event_loop().time() + VERIFY_TIMEOUT
         while asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(VERIFY_POLL_INTERVAL)
@@ -246,8 +297,9 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
             except Exception:
                 _LOGGER.debug("verify poll failed", exc_info=True)
                 continue
-            current = extract_shutter_states(payload).get(shutter_uuid)
-            if current is not None and current != baseline_slice:
+            if extract_shutter_positions(payload).get(shutter_uuid) != baseline_position:
+                return True
+            if extract_shutter_motion(payload).get(shutter_uuid) == 3:
                 return True
         return False
 
@@ -255,6 +307,7 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         assert self._plant_id is not None
         await self._send_command(
             shutter_uuid,
+            percent,
             lambda c: c.set_open_percent(self._plant_id, shutter_uuid.encode(), percent),
         )
 
@@ -262,6 +315,7 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         assert self._plant_id is not None
         await self._send_command(
             shutter_uuid,
+            100,
             lambda c: c.open_full(self._plant_id, shutter_uuid.encode()),
         )
 
@@ -269,6 +323,7 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         assert self._plant_id is not None
         await self._send_command(
             shutter_uuid,
+            0,
             lambda c: c.close_full(self._plant_id, shutter_uuid.encode()),
         )
 
