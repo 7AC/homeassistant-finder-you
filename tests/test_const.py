@@ -9,4 +9,4 @@ def test_constants_exist():
     assert const.CONF_PASSWORD == "password"
     assert const.CONF_PLANT_ID == "plant_id"
     assert const.DEFAULT_SCAN_INTERVAL_SECONDS == 60
-    assert const.PLATFORMS == ["cover"]
+    assert const.PLATFORMS == ["cover", "sensor"]

@@ -624,3 +624,68 @@ async def test_shutdown_closes_client(coord):
 async def test_shutdown_without_client_is_noop(coord):
     await coord.async_shutdown()
     assert coord._client is None
+
+
+# ---- telemetry freshness tracking ----------------------------------------
+
+
+def test_track_telemetry_freshness_stamps_on_first_diff(coord, monkeypatch):
+    """A poll that observes a per-shutter slice diff against the prior
+    poll must update ``last_telemetry_change_ts``. The first poll has
+    no baseline so it must NOT stamp (otherwise startup would falsely
+    register as 'fresh gateway activity')."""
+    state = {"slices": {"u1": b"A"}}
+    monkeypatch.setattr(mod, "extract_shutter_states", lambda _p: dict(state["slices"]))
+    # First poll: previous_slices is empty, should NOT stamp.
+    coord._track_telemetry_freshness(b"payload")
+    assert coord.last_telemetry_change_ts is None
+    # Second poll, same data: no diff, no stamp.
+    coord._track_telemetry_freshness(b"payload")
+    assert coord.last_telemetry_change_ts is None
+    # Third poll: u1's slice changed → stamp.
+    state["slices"] = {"u1": b"B"}
+    coord._track_telemetry_freshness(b"payload")
+    assert coord.last_telemetry_change_ts is not None
+
+
+async def test_send_command_stamps_last_command_ts_on_success(coord, monkeypatch):
+    """A successful verify must update ``last_successful_command_ts`` so
+    the diagnostic sensor reflects the most recent confirmed command."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.1)
+    monkeypatch.setattr(mod, "extract_shutter_positions", _position_stub([100, 50]))
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    assert coord.last_successful_command_ts is None
+    await coord._send_command("u1", 0, noop)
+    assert coord.last_successful_command_ts is not None
+
+
+async def test_send_command_stamps_last_command_ts_on_noop(coord, monkeypatch):
+    """The short-circuit path (already at target) must also count as a
+    successful command for diagnostic purposes — the gateway accepted
+    the RPC, we just didn't have to wait for motor evidence."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": 0})
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", 0, noop)
+    assert coord.last_successful_command_ts is not None

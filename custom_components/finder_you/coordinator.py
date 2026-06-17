@@ -21,6 +21,7 @@ from .api import (
     Shutter,
     extract_shutter_motion,
     extract_shutter_positions,
+    extract_shutter_states,
     fetch_token,
     parse_plant,
     refresh_token,
@@ -82,6 +83,15 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         self._plant_id: bytes | None = None
         self._plant_name: str = ""
         self._shutters: list[Shutter] = []
+        # Wedge characterization: track when the gateway last produced
+        # fresh telemetry for *any* shutter, so we can tell whether the
+        # cloud-to-puck link is alive without needing a user command.
+        # ``_previous_slices`` holds the per-shutter state slice from
+        # the last successful poll; any byte-level diff (motion, RSSI,
+        # position, anything) counts as the gateway being alive.
+        self._previous_slices: dict[str, bytes] = {}
+        self._last_telemetry_change_ts: float | None = None
+        self._last_successful_command_ts: float | None = None
 
     @property
     def plant_id(self) -> bytes | None:
@@ -94,6 +104,16 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
     @property
     def shutters(self) -> list[Shutter]:
         return self._shutters
+
+    @property
+    def last_telemetry_change_ts(self) -> float | None:
+        """Unix timestamp of the last poll that observed any slice diff."""
+        return self._last_telemetry_change_ts
+
+    @property
+    def last_successful_command_ts(self) -> float | None:
+        """Unix timestamp of the last verified command."""
+        return self._last_successful_command_ts
 
     async def _ensure_token(self) -> None:
         now = time.time()
@@ -183,7 +203,42 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         if shutters:
             self._shutters = shutters
         positions = extract_shutter_positions(plant_payload)
+        self._track_telemetry_freshness(plant_payload)
         return {s.uuid: positions.get(s.uuid) for s in self._shutters}
+
+    def _track_telemetry_freshness(self, plant_payload: bytes) -> None:
+        """Update freshness markers and log slice transitions.
+
+        We diff each shutter's per-shutter state slice against the prior
+        poll. Any byte-level difference (position, motion, RSSI, etc.)
+        is proof the gateway is still pushing data to the cloud — i.e.
+        the puck-to-Finder pipe is alive. Stretches of zero diffs while
+        commands are being issued, or stretches of any length on a quiet
+        plant, are what we want to characterize so we can find the
+        threshold that precedes a wedge.
+
+        Logs at INFO level so the user can `journalctl | grep
+        finder_you.coordinator` and see the timeline without flipping
+        DEBUG on the noisy lower layers.
+        """
+        new_slices = extract_shutter_states(plant_payload)
+        first_poll = not self._previous_slices
+        changed: list[str] = []
+        for uuid, slc in new_slices.items():
+            if self._previous_slices.get(uuid) != slc:
+                changed.append(uuid)
+        self._previous_slices = new_slices
+        # Skip the freshness stamp + log on the very first poll — every
+        # shutter looks "changed" because we had no baseline, and that
+        # would falsely register as gateway activity at startup.
+        if not changed or first_poll:
+            return
+        self._last_telemetry_change_ts = time.time()
+        _LOGGER.info(
+            "telemetry: %d shutter(s) updated: %s",
+            len(changed),
+            ", ".join(u[:8] for u in changed),
+        )
 
     async def _send_command(self, shutter_uuid: str, target: int, do_call) -> None:
         """Send a command, retrying with fresh handshake on verify failure.
@@ -263,6 +318,7 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         baseline_position = extract_shutter_positions(baseline_payload).get(shutter_uuid)
         if baseline_position == target:
             # Already at target — no motor movement to detect.
+            self._last_successful_command_ts = time.time()
             await self.async_request_refresh()
             return
         if not await self._wait_for_motor_evidence(shutter_uuid, baseline_position):
@@ -272,6 +328,7 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
             )
         # Verify succeeded: kick a coordinator refresh so HA's state
         # picks up the new position the next time HomeKit reads it.
+        self._last_successful_command_ts = time.time()
         await self.async_request_refresh()
 
     async def _wait_for_motor_evidence(
