@@ -216,12 +216,22 @@ HomeKit state. See
 
 **Caveat — plant-cache lag.** The position fields update *lazily*: a
 successful `SetOpenPercent` is reflected in the plant payload anywhere
-from a few seconds to a minute later, depending on the gateway's
-WiFi/MQTT link health. After issuing a command we poll `GetPlant`
-until the target shutter's state slice changes (or up to a 60-second
-timeout) before reporting success to HA. Trusting the cloud-level ack
-alone leads to false positives: the cloud accepts commands the gateway
-silently drops.
+from a few seconds to ~90 s later, depending on gateway WiFi/MQTT
+health and BLE-mesh load. During a 6-shutter scene we've seen every
+slice update slip past a 60 s window even though four of the shutters
+physically moved. After issuing a command we poll `GetPlant` until the
+target shutter's state slice changes (or up to a 180 s timeout) before
+reporting success to HA. Trusting the cloud-level ack alone leads to
+false positives: the cloud accepts commands the gateway silently
+drops.
+
+**Caveat — BLE-mesh fan-out.** The cloud accepts commands over WiFi,
+but the gateway then has to hop each command to the shutter via
+BLE-mesh. Firing six commands back-to-back swamps the mesh — the
+farthest hops (e.g. living-room and kitchen shutters in our setup) get
+dropped on the floor even though the cloud ack came back fine. We
+serialize sends with a 2 s inter-command gap so each BLE-mesh hop has
+time to land before the next one fires.
 
 **Caveat — stale subscriptions.** Even with the keepalive (re-sending
 the subscribe-client message every 30 s — see §4), the

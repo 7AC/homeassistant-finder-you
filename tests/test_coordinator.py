@@ -435,15 +435,17 @@ async def test_send_command_self_heals_on_first_failure(coord, monkeypatch):
     monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
     monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.01)
 
-    state = {"calls": 0}
+    # Track state across the two cycles. In cycle 1 every extract returns A,
+    # so verify times out. drop_client flips the flag; in cycle 2 the very
+    # first extract (baseline) still returns A, and from the second extract
+    # onward (the verify polls) it returns B — so the slice differs.
+    state = {"dropped": False, "post_drop_calls": 0}
 
     def fake_extract(_payload):
-        # 1st send_and_verify: baseline A then always A → timeout.
-        # 2nd send_and_verify (after drop_client): baseline A then B → success.
-        state["calls"] += 1
-        if state["calls"] < 30:
+        if not state["dropped"]:
             return {"u1": b"A"}
-        return {"u1": b"B"}
+        state["post_drop_calls"] += 1
+        return {"u1": b"A"} if state["post_drop_calls"] == 1 else {"u1": b"B"}
 
     monkeypatch.setattr(mod, "extract_shutter_states", fake_extract)
 
@@ -452,7 +454,11 @@ async def test_send_command_self_heals_on_first_failure(coord, monkeypatch):
 
     coord._run_or_reconnect = runner  # type: ignore[assignment]
     coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
-    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def fake_drop():
+        state["dropped"] = True
+
+    coord._drop_client = AsyncMock(side_effect=fake_drop)  # type: ignore[assignment]
 
     async def noop(c):
         return None

@@ -27,16 +27,19 @@ from .api import (
 )
 from .const import DEFAULT_SCAN_INTERVAL_SECONDS, DOMAIN
 
-# Minimum gap between consecutive command sends. Without this, a Home/Siri
-# scene that fires six concurrent close commands swamps the YESLY gateway's
-# MQTT link and the gateway silently drops half of them. With the gap, the
-# gateway processes each command cleanly. The gap is small enough that
-# single user-initiated taps feel instant.
-COMMAND_SEND_GAP = 0.25
+# Minimum gap between consecutive command sends. 250 ms was enough to stop
+# the WiFi-side burst, but during 6-shutter scenes the gateway's BLE-mesh
+# fan-out to the actual shutters still dropped the farthest hops (Cucina,
+# Salotto). 2 s gives BLE-mesh time to land each command before the next
+# one fires. Single user-initiated taps still feel instant because there's
+# nothing queued ahead of them.
+COMMAND_SEND_GAP = 2.0
 # How long after a command to wait for the gateway's plant-state cache to
-# reflect the change. Empirically the cache can lag 30-60 s behind the
-# physical action, so we give it that much time before declaring failure.
-VERIFY_TIMEOUT = 60.0
+# reflect the change. Empirically the cache lags 30-60 s for solo taps but
+# can stretch past 90 s during scene bursts. 180 s outwaits the worst case
+# we've observed; the alternative (declaring failure when the shutter
+# actually moved) is worse than making the user wait.
+VERIFY_TIMEOUT = 180.0
 # How often to re-fetch the plant during verification. Cheap call; tight
 # polling makes successful commands feel as fast as possible.
 VERIFY_POLL_INTERVAL = 2.0
