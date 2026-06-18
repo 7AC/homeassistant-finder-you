@@ -92,6 +92,9 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         self._previous_slices: dict[str, bytes] = {}
         self._last_telemetry_change_ts: float | None = None
         self._last_successful_command_ts: float | None = None
+        # Set whenever ``_ensure_client`` completes a fresh handshake.
+        # The watchdog uses this to schedule preemptive rehandshakes.
+        self._last_handshake_ts: float | None = None
 
     @property
     def plant_id(self) -> bytes | None:
@@ -114,6 +117,11 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
     def last_successful_command_ts(self) -> float | None:
         """Unix timestamp of the last verified command."""
         return self._last_successful_command_ts
+
+    @property
+    def last_handshake_ts(self) -> float | None:
+        """Unix timestamp of the last successful OpenNotificationChannel handshake."""
+        return self._last_handshake_ts
 
     async def _ensure_token(self) -> None:
         now = time.time()
@@ -153,6 +161,7 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
                 pass
             raise
         self._client = client
+        self._last_handshake_ts = time.time()
         return client
 
     async def _drop_client(self) -> None:

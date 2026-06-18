@@ -219,11 +219,15 @@ successful `SetOpenPercent` is reflected in the plant payload anywhere
 from a few seconds to ~90 s later, depending on gateway WiFi/MQTT
 health and BLE-mesh load. During a 6-shutter scene we've seen every
 slice update slip past a 60 s window even though four of the shutters
-physically moved. After issuing a command we poll `GetPlant` until the
-target shutter's state slice changes (or up to a 180 s timeout) before
-reporting success to HA. Trusting the cloud-level ack alone leads to
-false positives: the cloud accepts commands the gateway silently
-drops.
+physically moved. After issuing a command we poll `GetPlant` until we
+observe **motor evidence** for that shutter — either the position
+field (#13) changes from baseline, or the motion flag (#12) reads 3
+("driving") at any verify poll — or up to a 180 s timeout. Position
+alone isn't enough: the gateway clears `#13` when a command is queued
+and refills it from BLE-mesh telemetry, so a "100 → None" transition
+looks like motion even when no motor ran. Motion=3 is observed only
+when the gateway is actively driving the motor, so it's positive
+proof the BLE-mesh hop landed.
 
 **Caveat — BLE-mesh fan-out.** The cloud accepts commands over WiFi,
 but the gateway then has to hop each command to the shutter via
@@ -240,10 +244,36 @@ side after a server restart or claim expiry, and every subsequent
 `SetOpenPercent` is dropped on the floor even though `GetPlant` still
 works. The gateway only recovers when we tear down the HTTP/2
 connection and re-run the full 3-message handshake. The integration
-self-heals: on a verify timeout it drops the client and retries the
-command once before raising `GatewayOfflineError`, so this failure
-mode is invisible to the user unless the gateway is genuinely wedged
-(BLE-mesh side dead, not just the cloud subscription).
+self-heals on a verify timeout: it drops the client, re-handshakes,
+and retries the command — up to `MAX_SEND_ATTEMPTS = 3` total
+attempts — before raising `GatewayOfflineError`. The dominant cost
+of a wedge is the **first** 180 s verify timeout that detects it; the
+retry then completes within seconds because the fresh handshake
+re-establishes the puck's cloud-side claim.
+
+**Why no time-based watchdog.** A scheduled forced rehandshake every
+N minutes was tempting but is wasteful: the keepalive is fire-and-
+forget (subscribe-client gets no response on subsequent fires; we
+have no protocol-level "is the claim still good?" probe), and a
+healthy claim can survive for hours of idle time, so a periodic
+rehandshake churns the connection for no measurable benefit. The
+strongest staleness signal we currently have is "a real
+`SetOpenPercent` produced no motor evidence within 180 s" — that's
+the trigger the reactive self-heal uses. Preemptive rehandshake is
+worth adding only once we have a passive staleness signal that
+beats waiting for a verify timeout.
+
+**Caveat — observability is a separate concern.** We can't fix what
+we can't see. The coordinator now diffs each per-shutter slice
+against the prior poll and emits an `INFO` log line (`telemetry: N
+shutter(s) updated: <uuid-prefixes>`) for any byte-level change.
+Three diagnostic sensors expose freshness as seconds-ago:
+`Gateway telemetry age`, `Gateway last command age`, and
+`Gateway handshake age`. Watching `Gateway telemetry age` climb
+unbounded while `Gateway handshake age` is fresh is the
+fingerprint of a wedge — the cloud is talking to us, just not to
+the puck — and is the data we need to characterize the wedge
+cadence before designing a real preventive measure.
 
 ---
 

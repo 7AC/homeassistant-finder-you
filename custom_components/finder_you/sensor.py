@@ -36,6 +36,7 @@ async def async_setup_entry(
         [
             TelemetryAgeSensor(coordinator),
             LastCommandAgeSensor(coordinator),
+            HandshakeAgeSensor(coordinator),
         ]
     )
 
@@ -92,6 +93,28 @@ class LastCommandAgeSensor(_GatewayDiagnosticSensor):
     @property
     def native_value(self) -> float | None:
         ts = self.coordinator.last_successful_command_ts
+        if ts is None:
+            return None
+        return round(time.time() - ts, 1)
+
+
+class HandshakeAgeSensor(_GatewayDiagnosticSensor):
+    """Seconds since the last fresh ``OpenNotificationChannel`` handshake.
+
+    Bumps to 0 on startup, on a reactive self-heal triggered by a verify
+    timeout, and on a reconnect forced by ``_run_or_reconnect`` catching
+    an h2 error. Climbs monotonically the rest of the time. Useful for
+    correlating "how old is the cloud-side claim?" with wedge incidents.
+    """
+
+    _attr_name = "Gateway handshake age"
+
+    def __init__(self, coordinator: FinderYouCoordinator) -> None:
+        super().__init__(coordinator, "handshake_age")
+
+    @property
+    def native_value(self) -> float | None:
+        ts = self.coordinator.last_handshake_ts
         if ts is None:
             return None
         return round(time.time() - ts, 1)
