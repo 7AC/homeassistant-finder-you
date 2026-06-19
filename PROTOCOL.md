@@ -256,12 +256,40 @@ N minutes was tempting but is wasteful: the keepalive is fire-and-
 forget (subscribe-client gets no response on subsequent fires; we
 have no protocol-level "is the claim still good?" probe), and a
 healthy claim can survive for hours of idle time, so a periodic
-rehandshake churns the connection for no measurable benefit. The
-strongest staleness signal we currently have is "a real
-`SetOpenPercent` produced no motor evidence within 180 s" — that's
-the trigger the reactive self-heal uses. Preemptive rehandshake is
-worth adding only once we have a passive staleness signal that
-beats waiting for a verify timeout.
+rehandshake churns the connection for no measurable benefit.
+
+**Preemptive rehandshake on stale telemetry.** What we do instead:
+a fresh user command that arrives while the gateway has been silent
+(no per-shutter slice diff observed by polls) for more than
+`PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE` (default 10 min) drops the
+cloud client *before* the first send. The implicit reconnect on the
+next call re-runs the full 3-message OpenNotificationChannel
+handshake, which clears whatever cloud-side claim drift accumulated
+during the idle period. The reactive self-heal does the same thing
+— but only after a 180 s verify timeout, which is the dominant cost
+of "first scene of the morning takes three minutes." The preemptive
+gate folds that cost into the user command itself, so the first try
+lands directly. It only fires when there's actual evidence of drift
+(silent telemetry), not on a clock. Skipped when another command
+holds `_send_lock` so we don't yank the connection out from under
+an in-flight verify.
+
+**"Unknown baseline" fast-path.** The cloud cache periodically clears
+the position field for individual shutters (the data structure shows
+position field `#13` present but with no inner varint when this
+happens). When a command targets such a shutter we can't verify by
+position change — there's nothing to diff against. Treating that as
+a verify failure makes "close all" silently get stuck on
+`Closing…` for the full 3×180 s retry budget on any shutter that
+was already at the target, because already-at-target sends produce
+no motor evidence (the motor doesn't run if it's already there). To
+avoid this, when the baseline position is unknown but the gateway
+is still demonstrating it can push telemetry — `_telemetry_recent()`
+returns true for fresh slice diffs on *other* shutters — we accept
+the cloud-side send as success without waiting for motor evidence.
+Wedge state is explicitly excluded: stale telemetry plus unknown
+baseline means we have no signal of liveness at all, so we still
+run the full verify and surface the failure honestly.
 
 **Caveat — observability is a separate concern.** We can't fix what
 we can't see. The coordinator now diffs each per-shutter slice

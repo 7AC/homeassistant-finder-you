@@ -7,6 +7,7 @@ process without touching the network.
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -689,3 +690,170 @@ async def test_send_command_stamps_last_command_ts_on_noop(coord, monkeypatch):
 
     await coord._send_command("u1", 0, noop)
     assert coord.last_successful_command_ts is not None
+
+
+# ---- preemptive rehandshake on stale telemetry ----------------------------
+
+
+async def test_send_command_preemptively_rehandshakes_on_stale_telemetry(
+    coord, monkeypatch
+):
+    """If the puck hasn't pushed telemetry for longer than
+    PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE when a command arrives, drop the
+    client BEFORE the first send so the implicit reconnect re-runs the
+    full handshake. This is what turns 'first scene of the morning
+    takes 3 minutes' into 'completes in seconds'."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 1.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.1)
+    monkeypatch.setattr(mod, "extract_shutter_positions", _position_stub([100, 50]))
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+
+    # Stale telemetry: last update was 1 hour ago.
+    coord._last_telemetry_change_ts = time.time() - 3600
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", 0, noop)
+    # The preemptive drop must have fired exactly once, before any retry
+    # logic. (Retries do their own drop_client; if this test mistakenly
+    # asserted "any drop happened" the preemptive path could regress
+    # silently behind the retry path.)
+    coord._drop_client.assert_awaited_once()
+
+
+async def test_send_command_skips_preemptive_when_telemetry_fresh(coord, monkeypatch):
+    """A command that arrives while telemetry is recent must NOT pay the
+    cost of an unnecessary handshake."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 600.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.1)
+    monkeypatch.setattr(mod, "extract_shutter_positions", _position_stub([100, 50]))
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+
+    # Telemetry fresh: 5 seconds old, well below the 600 s threshold.
+    coord._last_telemetry_change_ts = time.time() - 5
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", 0, noop)
+    coord._drop_client.assert_not_awaited()
+
+
+async def test_send_command_treats_unknown_baseline_as_noop_when_gateway_fresh(
+    coord, monkeypatch
+):
+    """A close on a shutter whose cached position is None must complete
+    immediately when the gateway is otherwise healthy (recent telemetry
+    on other shutters). Otherwise an "already closed" shutter in a
+    scene gets stuck on Closing… for the full retry budget."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 600.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    # If we mistakenly entered the verify loop this short timeout would
+    # make the test raise GatewayOfflineError.
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.05)
+    # Baseline lookup returns None for this shutter, motion idle.
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": None})
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+
+    # Telemetry recent: 30 s old, well below the 600 s threshold.
+    coord._last_telemetry_change_ts = time.time() - 30
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", 0, noop)
+    # No verify retry, no failure, command marked successful.
+    assert coord.last_successful_command_ts is not None
+    coord._drop_client.assert_not_awaited()
+
+
+async def test_send_command_runs_full_verify_when_baseline_unknown_and_gateway_stale(
+    coord, monkeypatch
+):
+    """The 'baseline unknown' fast-path must NOT fire when the gateway
+    has been silent — that's the actual wedge state, where a missing
+    position means 'nothing is flowing', not 'cache expired for this
+    one shutter.' Falling for it would mask wedges as success."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 600.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.01)
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": None})
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+
+    # Telemetry stale: 1 hour old, past the 600 s threshold.
+    # This also triggers the preemptive rehandshake, so we expect at
+    # least one drop_client. The key behaviour we're checking: verify
+    # ran (and raised), instead of silently short-circuiting.
+    coord._last_telemetry_change_ts = time.time() - 3600
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    with pytest.raises(GatewayOfflineError):
+        await coord._send_command("u1", 0, noop)
+
+
+async def test_send_command_skips_preemptive_with_no_telemetry_baseline(
+    coord, monkeypatch
+):
+    """Right after startup ``_last_telemetry_change_ts`` is None — we
+    haven't observed any baseline yet. Treating that as 'infinitely
+    stale' would force an unnecessary handshake on the very first
+    user command after every HA restart."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 1.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.1)
+    monkeypatch.setattr(mod, "extract_shutter_positions", _position_stub([100, 50]))
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+
+    # No telemetry observation yet.
+    assert coord._last_telemetry_change_ts is None
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", 0, noop)
+    coord._drop_client.assert_not_awaited()

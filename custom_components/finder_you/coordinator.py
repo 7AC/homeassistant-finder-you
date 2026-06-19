@@ -52,6 +52,16 @@ MAX_SEND_ATTEMPTS = 3
 # How often to re-fetch the plant during verification. Cheap call; tight
 # polling makes successful commands feel as fast as possible.
 VERIFY_POLL_INTERVAL = 2.0
+# If the gateway hasn't pushed any telemetry for this many seconds when
+# a user command arrives, force a fresh OpenNotificationChannel handshake
+# before the first send attempt. The reactive self-heal already does
+# this — but only after a 180 s verify timeout. Doing it preemptively
+# when staleness is plausible turns "first scene of the morning waits
+# 3 minutes" into "first scene completes in seconds." Threshold picked
+# to be well below any normal idle window the cloud-side claim can
+# survive (we've seen healthy claims survive >>10 min idle in logs) so
+# we don't burn handshakes on innocent quiet stretches.
+PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE = 600.0  # 10 min
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -249,6 +259,38 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
             ", ".join(u[:8] for u in changed),
         )
 
+    def _telemetry_recent(self) -> bool:
+        """Has the gateway pushed any per-shutter slice diff in the
+        ``PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE`` window? When true, the
+        puck-to-cloud pipe is demonstrably alive even if a particular
+        shutter's cached position has expired — which is what lets us
+        treat a `baseline_position is None` send as a safe no-op
+        without falling for a wedge."""
+        if self._last_telemetry_change_ts is None:
+            return False
+        return time.time() - self._last_telemetry_change_ts < PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE
+
+    def _should_preemptive_rehandshake(self) -> bool:
+        """Decide whether to drop the cloud client before the first send.
+
+        Triggers when the puck has been silent (no per-shutter slice
+        diff observed by polls) for longer than
+        ``PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE``. Strong empirical signal
+        of cloud-subscription drift: the morning of 2026-06-18 had 8 h
+        of zero telemetry before the first user scene sat through three
+        180 s verify timeouts in a row. With this gate the first send
+        forces the fresh handshake directly.
+
+        Skipped while another command is already in flight (``_send_lock``
+        held) — that command will either heal the connection or surface
+        a real failure; ripping out the client underneath it would just
+        cascade.
+        """
+        if self._last_telemetry_change_ts is None or self._send_lock.locked():
+            return False
+        age = time.time() - self._last_telemetry_change_ts
+        return age >= PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE
+
     async def _send_command(self, shutter_uuid: str, target: int, do_call) -> None:
         """Send a command, retrying with fresh handshake on verify failure.
 
@@ -264,7 +306,20 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         to ``MAX_SEND_ATTEMPTS`` times; if all of them fail to elicit
         motor evidence the gateway is truly wedged for this shutter and
         we raise so HA can surface the failure.
+
+        Before the first attempt we may also do a *preemptive*
+        rehandshake — see ``_should_preemptive_rehandshake`` — which
+        skips an otherwise-guaranteed 180 s verify timeout when the
+        gateway's telemetry has been silent long enough to suggest
+        subscription drift.
         """
+        if self._should_preemptive_rehandshake():
+            age = time.time() - self._last_telemetry_change_ts  # type: ignore[operator]
+            _LOGGER.info(
+                "telemetry silent for %.0fs; preemptive rehandshake before send",
+                age,
+            )
+            await self._drop_client()
         for attempt in range(MAX_SEND_ATTEMPTS):
             try:
                 await self._send_and_verify(shutter_uuid, target, do_call)
@@ -327,6 +382,25 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         baseline_position = extract_shutter_positions(baseline_payload).get(shutter_uuid)
         if baseline_position == target:
             # Already at target — no motor movement to detect.
+            self._last_successful_command_ts = time.time()
+            await self.async_request_refresh()
+            return
+        if baseline_position is None and self._telemetry_recent():
+            # The cloud doesn't have a position cached for this shutter
+            # but the gateway is producing fresh slice diffs for *other*
+            # shutters, so the puck is alive — the empty field just means
+            # this particular shutter's telemetry has expired in the
+            # cloud cache. Verifying by motor evidence would time out:
+            # the most common reason for an expired-cache shutter to
+            # receive a close command is that it's already closed (the
+            # scene fired on everything). Accept the send optimistically
+            # and let the next coordinator poll correct any false
+            # success. This is the path that fixed "already-closed
+            # shutters stuck on Closing… for 9 minutes."
+            _LOGGER.debug(
+                "%s baseline unknown but telemetry fresh — treating as no-op",
+                shutter_uuid,
+            )
             self._last_successful_command_ts = time.time()
             await self.async_request_refresh()
             return
