@@ -762,9 +762,12 @@ async def test_send_command_treats_unknown_baseline_as_noop_when_gateway_fresh(
     coord, monkeypatch
 ):
     """A close on a shutter whose cached position is None must complete
-    immediately when the gateway is otherwise healthy (recent telemetry
-    on other shutters). Otherwise an "already closed" shutter in a
-    scene gets stuck on Closing… for the full retry budget."""
+    successfully (not raise GatewayOfflineError) when the gateway is
+    otherwise healthy. Even though the live-client-reclaim path now
+    fires an in-line reclaim on the first fast-path success, the
+    overall outcome is still 'command succeeded' — that's the property
+    this test guards. Otherwise an "already closed" shutter in a scene
+    gets stuck on Closing… for the full retry budget."""
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
     monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 600.0)
     monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
@@ -789,9 +792,8 @@ async def test_send_command_treats_unknown_baseline_as_noop_when_gateway_fresh(
         return None
 
     await coord._send_command("u1", 0, noop)
-    # No verify retry, no failure, command marked successful.
+    # Command marked successful (no GatewayOfflineError raised).
     assert coord.last_successful_command_ts is not None
-    coord._drop_client.assert_not_awaited()
 
 
 async def test_send_command_runs_full_verify_when_baseline_unknown_and_gateway_stale(
@@ -828,19 +830,15 @@ async def test_send_command_runs_full_verify_when_baseline_unknown_and_gateway_s
         await coord._send_command("u1", 0, noop)
 
 
-async def test_send_command_reclaims_live_client_after_unverified_sends(
-    coord, monkeypatch
-):
-    """When N consecutive sends complete via the fast-path (unknown
-    baseline + fresh telemetry, no motor evidence ever observed), the
-    next command must force a fresh handshake — this is the live-client
-    takeover heuristic. Simulates: Finder YOU mobile app silently
-    demotes us, our SetOpenPercent RPCs vanish into the void, our
-    fast-path keeps reporting success because we can't tell empty
-    cache from silent failure. After enough in a row, we reclaim."""
+async def test_send_command_reclaims_inline_on_first_fast_path(coord, monkeypatch):
+    """A single fast-path success within one command must trigger an
+    in-line reclaim+retry on the SAME command, so the user's tap
+    actually drives the motor on the first try after takeover. The
+    retry is bounded: if it also succeeds via fast-path, we accept
+    (true no-op) rather than loop forever burning handshakes."""
     monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
     monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 600.0)
-    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS", 2)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS", 1)
     monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
     monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.05)
     monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": None})
@@ -858,24 +856,58 @@ async def test_send_command_reclaims_live_client_after_unverified_sends(
     async def noop(c):
         return None
 
-    # Send 1: fast-path success, suspicion 1, no preemptive yet.
-    await coord._send_command("u1", 0, noop)
-    coord._drop_client.assert_not_awaited()
-    assert coord._unverified_send_count == 1
-
-    # Send 2: fast-path success, suspicion 2, still no preemptive
-    # (the gate triggers BEFORE the third send, not at the moment
-    # the counter hits the threshold).
-    await coord._send_command("u1", 0, noop)
-    coord._drop_client.assert_not_awaited()
-    assert coord._unverified_send_count == 2
-
-    # Send 3: at start of this send the gate fires, drop_client runs,
-    # counter resets to 0. The actual send still proceeds via fast-path
-    # so suspicion rises back to 1 after.
+    # Single command: attempt 0 hits fast-path (no motor evidence)
+    # → in-line reclaim → attempt 1 also fast-path → accepted.
+    # drop_client called exactly once: the in-line reclaim. No
+    # additional reclaim on the second attempt (throttled).
     await coord._send_command("u1", 0, noop)
     coord._drop_client.assert_awaited_once()
+    # Counter ends at 1: rolled back to 0 before the retry, then
+    # incremented by the retry's fast-path.
     assert coord._unverified_send_count == 1
+
+
+async def test_send_command_inline_reclaim_skipped_when_retry_yields_evidence(
+    coord, monkeypatch
+):
+    """When the in-line reclaim works (retry produces real motor
+    evidence), the counter must be reset and no further reclaims
+    should fire for this command. This is the happy path: takeover
+    detected, reclaimed, motor moved."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 600.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS", 1)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.1)
+    # Attempt 0: baseline None, telemetry fresh → fast-path success.
+    # Attempt 1: baseline 100, then 50 → real motor evidence.
+    pos_seq = iter([{"u1": None}, {"u1": 100}, {"u1": 50}, {"u1": 50}])
+
+    def pos_extract(_p):
+        try:
+            return next(pos_seq)
+        except StopIteration:
+            return {"u1": 50}
+
+    monkeypatch.setattr(mod, "extract_shutter_positions", pos_extract)
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+    coord._last_telemetry_change_ts = time.time() - 30
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", 0, noop)
+    # Exactly one drop: the in-line reclaim between attempts.
+    coord._drop_client.assert_awaited_once()
+    # Counter reset to 0 by the second attempt's real motor evidence.
+    assert coord._unverified_send_count == 0
 
 
 async def test_real_motor_evidence_resets_unverified_counter(coord, monkeypatch):

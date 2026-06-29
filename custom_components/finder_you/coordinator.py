@@ -68,9 +68,11 @@ PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE = 600.0  # 10 min
 # YOU app silently demotes us when it's opened: subsequent SetOpenPercent
 # RPCs are accepted by the cloud but never reach the puck. Our fast-path
 # can't tell the difference between "shutter already at target" and
-# "command went into a void" — both look identical. After enough
-# consecutive misses, force a fresh handshake to reclaim the claim.
-PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS = 2
+# "command went into a void" — both look identical. Threshold of 1
+# means we reclaim immediately on the *current* user command rather
+# than making the first post-takeover tap silently fail and recovering
+# on the second.
+PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS = 1
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -358,10 +360,21 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
             # Give the freshly reclaimed claim a clean slate before we
             # start re-incrementing the suspicion counter.
             self._unverified_send_count = 0
+        # We allow one in-line reclaim+retry per command: if the first
+        # attempt returns via the unknown-baseline fast-path (no motor
+        # evidence ever observed) we can't tell whether it was a true
+        # no-op or a silent failure due to live-client takeover. Rather
+        # than guess, drop the client to force a fresh handshake and
+        # try once more. A second fast-path success after a fresh claim
+        # is accepted as a true no-op — if even the reclaim didn't
+        # surface motor evidence, the shutter is almost certainly at
+        # target. Bounded to one reclaim-retry to keep scene UX from
+        # paying a handshake cost per shutter when nothing's broken.
+        inline_reclaim_used = False
         for attempt in range(MAX_SEND_ATTEMPTS):
+            pre_count = self._unverified_send_count
             try:
                 await self._send_and_verify(shutter_uuid, target, do_call)
-                return
             except GatewayOfflineError:
                 if attempt == MAX_SEND_ATTEMPTS - 1:
                     raise
@@ -373,6 +386,24 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
                     MAX_SEND_ATTEMPTS,
                 )
                 await self._drop_client()
+                continue
+            if (
+                self._unverified_send_count > pre_count
+                and not inline_reclaim_used
+                and attempt + 1 < MAX_SEND_ATTEMPTS
+            ):
+                _LOGGER.info(
+                    "%s succeeded only via fast-path; reclaiming live-client "
+                    "and retrying once",
+                    shutter_uuid,
+                )
+                await self._drop_client()
+                # Roll the suspicion counter back so the retry starts
+                # fresh — if it also goes via fast-path we'll re-increment.
+                self._unverified_send_count = pre_count
+                inline_reclaim_used = True
+                continue
+            return
 
     async def _send_and_verify(self, shutter_uuid: str, target: int, do_call) -> None:
         """One send-then-verify cycle.

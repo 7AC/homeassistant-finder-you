@@ -299,16 +299,29 @@ never reach the puck — and there's no protocol-level signal that
 tells us we've been demoted. Verify timeouts catch this eventually,
 but the unknown-baseline fast-path masks it: it reports success
 without observing motor activity. We work around this with a
-suspicion counter (`_unverified_send_count`). Every fast-path
-success increments it; every command that observes real motor
-evidence (or sees a baseline exactly matching the target, which
-proves cloud-cache → us is alive on the subscription) resets it.
-After `PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS` (default 2) consecutive
-unverified sends, the next command forces a fresh handshake —
-reclaiming live-client. We can't distinguish "true no-op" from
-"silent failure" in a single command, but consecutive ones are
-diagnostic. Cost of being wrong is ~3 s of handshake every couple
-of innocent no-ops; cost of being right is no more "Apple Home
+two-level reclaim:
+
+1. **In-line reclaim+retry within one command.** If the first
+   attempt of a send returns via the fast-path (no motor evidence),
+   we immediately drop the cloud client to force a fresh
+   `OpenNotificationChannel` handshake and try the send once more.
+   The user's *first* tap after the Finder app session — the one
+   that would otherwise silently no-op — recovers within the same
+   service call. Bounded to one reclaim-retry per command so a
+   genuine no-op (close on already-closed shutter) doesn't loop.
+
+2. **Cross-command reclaim via suspicion counter.** The fast-path
+   also bumps `_unverified_send_count`; real motor evidence (or a
+   `baseline == target` short-circuit, which proves cloud-cache →
+   us is alive on the subscription) resets it. Once it reaches
+   `PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS` (default 1, single tap
+   is enough), the *next* command's preemptive-rehandshake gate
+   fires. Belt-and-suspenders with the in-line path above: handles
+   the case where the in-line retry also goes via fast-path (true
+   no-op) but the previous command was the one that lost the claim.
+
+Cost of being wrong is one extra handshake (~3 s) on the first
+fast-path of a session; cost of being right is no more "Apple Home
 says it worked but the shutter didn't move" surprises after using
 the Finder app.
 
