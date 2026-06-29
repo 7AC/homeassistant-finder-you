@@ -828,6 +828,110 @@ async def test_send_command_runs_full_verify_when_baseline_unknown_and_gateway_s
         await coord._send_command("u1", 0, noop)
 
 
+async def test_send_command_reclaims_live_client_after_unverified_sends(
+    coord, monkeypatch
+):
+    """When N consecutive sends complete via the fast-path (unknown
+    baseline + fresh telemetry, no motor evidence ever observed), the
+    next command must force a fresh handshake — this is the live-client
+    takeover heuristic. Simulates: Finder YOU mobile app silently
+    demotes us, our SetOpenPercent RPCs vanish into the void, our
+    fast-path keeps reporting success because we can't tell empty
+    cache from silent failure. After enough in a row, we reclaim."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 600.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS", 2)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.05)
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": None})
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+
+    coord._last_telemetry_change_ts = time.time() - 30  # fresh
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    # Send 1: fast-path success, suspicion 1, no preemptive yet.
+    await coord._send_command("u1", 0, noop)
+    coord._drop_client.assert_not_awaited()
+    assert coord._unverified_send_count == 1
+
+    # Send 2: fast-path success, suspicion 2, still no preemptive
+    # (the gate triggers BEFORE the third send, not at the moment
+    # the counter hits the threshold).
+    await coord._send_command("u1", 0, noop)
+    coord._drop_client.assert_not_awaited()
+    assert coord._unverified_send_count == 2
+
+    # Send 3: at start of this send the gate fires, drop_client runs,
+    # counter resets to 0. The actual send still proceeds via fast-path
+    # so suspicion rises back to 1 after.
+    await coord._send_command("u1", 0, noop)
+    coord._drop_client.assert_awaited_once()
+    assert coord._unverified_send_count == 1
+
+
+async def test_real_motor_evidence_resets_unverified_counter(coord, monkeypatch):
+    """A command that does see real motor evidence (motion=3 or position
+    change) is proof we still hold live-client status — must reset the
+    counter so we don't fire a reclaim handshake on the next no-op."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE", 600.0)
+    monkeypatch.setattr(mod, "VERIFY_POLL_INTERVAL", 0.001)
+    monkeypatch.setattr(mod, "VERIFY_TIMEOUT", 0.1)
+    monkeypatch.setattr(mod, "extract_shutter_positions", _position_stub([100, 50]))
+    monkeypatch.setattr(mod, "extract_shutter_motion", lambda _p: {"u1": 2})
+
+    # Start with a non-zero suspicion count — simulate prior fast-path
+    # successes.
+    coord._unverified_send_count = 5
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+    coord._drop_client = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", 0, noop)
+    # Real verify (baseline 100 → poll 50) → counter must reset.
+    assert coord._unverified_send_count == 0
+
+
+async def test_baseline_matching_target_resets_unverified_counter(
+    coord, monkeypatch
+):
+    """The 'already at target' short-circuit means we observed the
+    exact target value in cache — definitive proof the puck-to-cloud
+    pipe is alive on our subscription. Reset the suspicion counter."""
+    monkeypatch.setattr(mod, "COMMAND_SEND_GAP", 0.0)
+    monkeypatch.setattr(mod, "extract_shutter_positions", lambda _p: {"u1": 100})
+
+    coord._unverified_send_count = 3
+
+    async def runner(fn):
+        return await fn(AsyncMock())
+
+    coord._run_or_reconnect = runner  # type: ignore[assignment]
+    coord.async_request_refresh = AsyncMock()  # type: ignore[assignment]
+
+    async def noop(c):
+        return None
+
+    await coord._send_command("u1", 100, noop)
+    assert coord._unverified_send_count == 0
+
+
 async def test_send_command_skips_preemptive_with_no_telemetry_baseline(
     coord, monkeypatch
 ):

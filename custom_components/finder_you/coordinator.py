@@ -62,6 +62,15 @@ VERIFY_POLL_INTERVAL = 2.0
 # survive (we've seen healthy claims survive >>10 min idle in logs) so
 # we don't burn handshakes on innocent quiet stretches.
 PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE = 600.0  # 10 min
+# How many consecutive fast-path "success" sends (baseline unknown,
+# telemetry fresh, no motor evidence ever observed) we tolerate before
+# concluding another app has taken the live-client slot. The Finder
+# YOU app silently demotes us when it's opened: subsequent SetOpenPercent
+# RPCs are accepted by the cloud but never reach the puck. Our fast-path
+# can't tell the difference between "shutter already at target" and
+# "command went into a void" — both look identical. After enough
+# consecutive misses, force a fresh handshake to reclaim the claim.
+PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS = 2
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -105,6 +114,13 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         # Set whenever ``_ensure_client`` completes a fresh handshake.
         # The watchdog uses this to schedule preemptive rehandshakes.
         self._last_handshake_ts: float | None = None
+        # Consecutive fast-path successes (baseline unknown, telemetry
+        # fresh) with no motor evidence ever observed. Increments on
+        # each fast-path, resets on any real verify that sees motor
+        # activity. When it hits PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS
+        # we assume another app stole the live-client slot and force a
+        # rehandshake to reclaim it.
+        self._unverified_send_count: int = 0
 
     @property
     def plant_id(self) -> bytes | None:
@@ -273,23 +289,37 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
     def _should_preemptive_rehandshake(self) -> bool:
         """Decide whether to drop the cloud client before the first send.
 
-        Triggers when the puck has been silent (no per-shutter slice
-        diff observed by polls) for longer than
-        ``PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE``. Strong empirical signal
-        of cloud-subscription drift: the morning of 2026-06-18 had 8 h
-        of zero telemetry before the first user scene sat through three
-        180 s verify timeouts in a row. With this gate the first send
-        forces the fresh handshake directly.
+        Two independent triggers:
+
+          * **Stale telemetry**: the puck hasn't produced any per-shutter
+            slice diff for longer than
+            ``PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE``. Strong empirical
+            signal of cloud-subscription drift (morning of 2026-06-18:
+            8 h of zero telemetry before the first scene sat through
+            three 180 s verify timeouts).
+
+          * **Live-client takeover**: ``_unverified_send_count`` has
+            accumulated past ``PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS``.
+            When the Finder YOU mobile app is opened it silently grabs
+            the live-client slot from us — our SetOpenPercent RPCs are
+            accepted by the cloud but never reach the puck. We can't
+            distinguish a true no-op (shutter at target) from a silent
+            takeover within one command, but consecutive no-evidence
+            commands across different shutters/targets are diagnostic.
 
         Skipped while another command is already in flight (``_send_lock``
-        held) — that command will either heal the connection or surface
-        a real failure; ripping out the client underneath it would just
-        cascade.
+        held) — ripping out the client underneath it would just cascade.
         """
-        if self._last_telemetry_change_ts is None or self._send_lock.locked():
+        if self._send_lock.locked():
             return False
-        age = time.time() - self._last_telemetry_change_ts
-        return age >= PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE
+        if (
+            self._last_telemetry_change_ts is not None
+            and time.time() - self._last_telemetry_change_ts >= PREEMPTIVE_HANDSHAKE_TELEMETRY_AGE
+        ):
+            return True
+        if self._unverified_send_count >= PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS:
+            return True
+        return False
 
     async def _send_command(self, shutter_uuid: str, target: int, do_call) -> None:
         """Send a command, retrying with fresh handshake on verify failure.
@@ -314,12 +344,20 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
         subscription drift.
         """
         if self._should_preemptive_rehandshake():
-            age = time.time() - self._last_telemetry_change_ts  # type: ignore[operator]
+            tel = (
+                f"telemetry {time.time() - self._last_telemetry_change_ts:.0f}s old"
+                if self._last_telemetry_change_ts is not None
+                else "no telemetry baseline"
+            )
             _LOGGER.info(
-                "telemetry silent for %.0fs; preemptive rehandshake before send",
-                age,
+                "preemptive rehandshake before send (%s, %d unverified sends)",
+                tel,
+                self._unverified_send_count,
             )
             await self._drop_client()
+            # Give the freshly reclaimed claim a clean slate before we
+            # start re-incrementing the suspicion counter.
+            self._unverified_send_count = 0
         for attempt in range(MAX_SEND_ATTEMPTS):
             try:
                 await self._send_and_verify(shutter_uuid, target, do_call)
@@ -381,7 +419,12 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
 
         baseline_position = extract_shutter_positions(baseline_payload).get(shutter_uuid)
         if baseline_position == target:
-            # Already at target — no motor movement to detect.
+            # Already at target — no motor movement to detect. This is
+            # a definite no-op (we saw the exact target value), so we
+            # also reset the suspicion counter: the cloud showed us a
+            # current value, which means the puck-to-cloud pipe is
+            # alive on our subscription.
+            self._unverified_send_count = 0
             self._last_successful_command_ts = time.time()
             await self.async_request_refresh()
             return
@@ -396,10 +439,17 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
             # scene fired on everything). Accept the send optimistically
             # and let the next coordinator poll correct any false
             # success. This is the path that fixed "already-closed
-            # shutters stuck on Closing… for 9 minutes."
+            # shutters stuck on Closing… for 9 minutes." Increments the
+            # suspicion counter because we have *no* evidence this
+            # particular send reached the motor: it could be a true
+            # no-op OR a silent failure (another app holds live-client
+            # status). The counter triggers a reclaim handshake after
+            # ``PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS`` in a row.
+            self._unverified_send_count += 1
             _LOGGER.debug(
-                "%s baseline unknown but telemetry fresh — treating as no-op",
+                "%s baseline unknown but telemetry fresh — treating as no-op (suspicion %d)",
                 shutter_uuid,
+                self._unverified_send_count,
             )
             self._last_successful_command_ts = time.time()
             await self.async_request_refresh()
@@ -409,6 +459,9 @@ class FinderYouCoordinator(DataUpdateCoordinator[dict]):
                 f"gateway didn't reflect {shutter_uuid} within "
                 f"{VERIFY_TIMEOUT:.0f}s — likely offline or congested"
             )
+        # Real motor evidence — the puck heard us and drove the motor.
+        # That's positive proof we still hold the live-client claim.
+        self._unverified_send_count = 0
         # Verify succeeded: kick a coordinator refresh so HA's state
         # picks up the new position the next time HomeKit reads it.
         self._last_successful_command_ts = time.time()

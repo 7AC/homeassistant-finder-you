@@ -291,6 +291,27 @@ Wedge state is explicitly excluded: stale telemetry plus unknown
 baseline means we have no signal of liveness at all, so we still
 run the full verify and surface the failure honestly.
 
+**Live-client takeover.** `OpenNotificationChannel` grants live-client
+status to one app at a time. When the Finder YOU mobile app is
+opened it silently demotes us: our cloud-side `SetOpenPercent` RPCs
+keep getting accepted (the cloud answers with success) but they
+never reach the puck — and there's no protocol-level signal that
+tells us we've been demoted. Verify timeouts catch this eventually,
+but the unknown-baseline fast-path masks it: it reports success
+without observing motor activity. We work around this with a
+suspicion counter (`_unverified_send_count`). Every fast-path
+success increments it; every command that observes real motor
+evidence (or sees a baseline exactly matching the target, which
+proves cloud-cache → us is alive on the subscription) resets it.
+After `PREEMPTIVE_HANDSHAKE_UNVERIFIED_SENDS` (default 2) consecutive
+unverified sends, the next command forces a fresh handshake —
+reclaiming live-client. We can't distinguish "true no-op" from
+"silent failure" in a single command, but consecutive ones are
+diagnostic. Cost of being wrong is ~3 s of handshake every couple
+of innocent no-ops; cost of being right is no more "Apple Home
+says it worked but the shutter didn't move" surprises after using
+the Finder app.
+
 **Caveat — observability is a separate concern.** We can't fix what
 we can't see. The coordinator now diffs each per-shutter slice
 against the prior poll and emits an `INFO` log line (`telemetry: N
